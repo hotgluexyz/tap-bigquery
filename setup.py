@@ -2,24 +2,22 @@
 from setuptools import setup
 
 setup(
-    name="tap-firebase",
+    name="tap-bigquery",
     version="0.1.0",
-    description="Singer.io tap for extracting data",
-    author="Stitch",
-    url="http://singer.io",
+    description="Singer.io tap for extracting data from BigQuery tables",
+    author="FIXD Automotive, Inc",
+    url="https://github.com/fixdauto/tap-bigquery",
     classifiers=["Programming Language :: Python :: 3 :: Only"],
-    py_modules=["tap_firebase"],
+    py_modules=["tap_bigquery"],
     install_requires=[
         "singer-python>=5.0.12",
         "requests",
+        "google-cloud-bigquery>=1.26.1"
     ],
     entry_points="""
     [console_scripts]
-    tap-firebase=tap_firebase:main
+    tap-bigquery=tap_bigquery:main
     """,
-    packages=["tap_firebase"],
-    package_data = {
-        "schemas": ["tap_firebase/schemas/*.json"]
-    },
+    packages=["tap_bigquery"],
     include_package_data=True,
 )

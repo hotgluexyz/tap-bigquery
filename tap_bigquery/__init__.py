@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import os
+import json
+import singer
+import datetime
+from datetime import timedelta
+from singer import Transformer, utils, metadata
+from singer.catalog import Catalog, CatalogEntry
+from singer.schema import Schema
+
+from google.oauth2 import service_account
+from google.cloud import bigquery
+
+REQUIRED_CONFIG_KEYS = ['start_date', 'project', 'credentials_path']
+LOGGER = singer.get_logger()
+
+TYPE_MAP = {
+    'STRING': { 'type': 'string'},
+    'BOOLEAN':  { 'type': 'boolean' },
+    'BOOL':  { 'type': 'boolean' },
+    'INTEGER': { 'type': 'integer' },
+    'INT64': { 'type': 'integer' },
+    'FLOAT': { 'type': 'number', 'format': 'float' },
+    'FLOAT64': { 'type': 'number', 'format': 'float' },
+    'TIMESTAMP': { 'type': 'string', 'format': 'date-time' },
+    'DATETIME': { 'type': 'string', 'format': 'date-time' },
+    'DATE': { 'type': 'string', 'format': 'date' },
+    'TIME': { 'type': 'string', 'format': 'time' },
+    # TODO: 'BYTES' - I'm not sure how this comes, maybe a list of ints?
+}
+
+def convert_schemafield_to_jsonschema(schemafields):
+    jsonschema = { 'type': 'object', 'properties': {} }
+
+    for schemafield in schemafields:
+        if schemafield.field_type in TYPE_MAP:
+            jsonschema['properties'][schemafield.name] = TYPE_MAP[schemafield.field_type].copy()
+        elif schemafield.field_type == 'RECORD' or schemafield.field_type == 'STRUCT':
+            jsonschema['properties'][schemafield.name] = convert_schemafield_to_jsonschema(schemafield.fields)
+        else:
+            raise NotImplementedError(f"Field type not supported: {schemafield.field_type}")
+
+        if schemafield.mode == 'NULLABLE':
+            type = jsonschema['properties'][schemafield.name]['type']
+            jsonschema['properties'][schemafield.name]['type'] = ['null', type]
+        elif schemafield.mode == 'REPEATED':
+            jsonschema['properties'][schemafield.name] = {
+                'type': 'array',
+                'items': jsonschema['properties'][schemafield.name]
+            }
+        jsonschema['properties'][schemafield.name]['description'] = schemafield.description
+    return jsonschema
+
+
+def discover(config, client):
+    project = config["project"]
+    streams = []
+
+    for dataset in client.list_datasets(project):
+        for t in client.list_tables(dataset.dataset_id):
+            if not t.time_partitioning:
+                LOGGER.info(f"Skipping table {t.full_table_id}: Currently only time-partitioned tables are supported")
+                continue
+
+            # Load the full table details to get the schema
+            table = client.get_table(f"{dataset.dataset_id}.{t.table_id}")
+            # import pdb; pdb.set_trace()
+
+            partition_type = table.time_partitioning.type_
+            if partition_type == 'DAY':
+                partition_size = timedelta(days=1) 
+            elif partition_type == 'HOUR':
+                partition_size = timedelta(hour=1) 
+            else:
+                raise NotImplementedError(f"Unsupported partition type: {partition_type}")
+
+            schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
+
+            # Try and guess required properties by looking for required fields that end in "id"
+            # if this doesn't work, users can always specify their own key-properties with catalog
+            key_properties = [s.name for s in table.schema if s.mode == 'REQUIRED' and s.name.lower().endswith("id")]
+            replication_key = table.time_partitioning.field
+            stream_metadata = [
+                {
+                  'metadata': {
+                    'inclusion': 'available',
+                    'table-key-properties': key_properties,
+                    'selected': True,
+                    'replication-key': replication_key,
+                    'table-name': table.table_id,
+                    'table-created-at': utils.strftime(table.created),
+                    'table-labels': table.labels,
+                    'table-partition-size': partition_size.total_seconds(),
+                  },
+                  'breadcrumb': []
+                }
+            ]
+            streams.append(
+                CatalogEntry(
+                    tap_stream_id=table.full_table_id,
+                    stream=table.table_id,
+                    schema=schema,
+                    key_properties=key_properties,
+                    metadata=stream_metadata,
+                    replication_key=replication_key,
+                    is_view=None,
+                    database=None,
+                    table=None,
+                    row_count=None,
+                    stream_alias=None,
+                    replication_method=None,
+                )
+            )
+
+    return Catalog(streams)
+
+
+def sync(config, state, catalog, client):
+    """ Sync data from tap source """
+    # Loop over selected streams in catalog
+    for stream in catalog.get_selected_streams(state):
+        LOGGER.info("Syncing stream:" + stream.tap_stream_id)
+
+        bookmark_column = stream.replication_key
+
+        limit = config.get('step', 10000)
+
+        import pdb; pdb.set_trace()
+
+        singer.write_schema(
+            stream_name=stream.tap_stream_id,
+            schema=stream.schema,
+            key_properties=stream.key_properties,
+        )
+
+        start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
+        with Transformer() as transformer:
+            while True:
+                params = {
+                    'table': stream.tap_stream_id,
+                    'bookmark_column': bookmark_column,
+                    'start_date': start_date,
+                    'limit': limit,
+                }
+                query = """SELECT * FROM {table} WHERE {bookmark_column} > timestamp {start_date} ORDER BY {bookmark_column}""".format(**params)
+                LOGGER.info("Running query:\n    %s" % query)
+                query_job = client.query(query)
+
+                # query_job.result(page_size=,retry=,timeout=)
+                for row in query_job:
+                    record = { k: v for k, v in row.items() }
+                    record = transformer.transform(row, stream.schema)
+                    start_date = utils.strftime(row[bookmark_column])
+                    singer.write_record(stream.tap_stream_id, row)
+
+                singer.write_state({stream.tap_stream_id: start_date})
+
+                if query_job.total_rows < limit:
+                    break
+
+
+@utils.handle_top_exception(LOGGER)
+def main():
+    # Parse command line arguments
+    args = utils.parse_args(REQUIRED_CONFIG_KEYS)
+
+    credentials = service_account.Credentials.from_service_account_file(args.config['credentials_path'])
+    client = bigquery.Client(project=args.config['project'], credentials=credentials)
+
+    # If discover flag was passed, run discovery mode and dump output to stdout
+    if args.discover:
+        catalog = discover(args.config, client)
+        catalog.dump()
+    # Otherwise run in sync mode
+    else:
+        if args.catalog:
+            catalog = args.catalog
+        else:
+            catalog = discover(args.config, client)
+        sync(args.config, args.state, catalog, client)
+
+
+if __name__ == '__main__':
+    main()
