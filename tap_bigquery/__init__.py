@@ -3,7 +3,7 @@ import os
 import json
 import singer
 import datetime
-from datetime import timedelta
+from datetime import timedelta, timezone
 from singer import Transformer, utils, metadata
 from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
@@ -62,9 +62,10 @@ def discover(config, client):
                 LOGGER.info(f"Skipping table {t.full_table_id}: Currently only time-partitioned tables are supported")
                 continue
 
+            full_table_id = f"{project}.{dataset.dataset_id}.{t.table_id}"
+
             # Load the full table details to get the schema
-            table = client.get_table(f"{dataset.dataset_id}.{t.table_id}")
-            # import pdb; pdb.set_trace()
+            table = client.get_table(full_table_id)
 
             partition_type = table.time_partitioning.type_
             if partition_type == 'DAY':
@@ -84,10 +85,9 @@ def discover(config, client):
                 {
                   'metadata': {
                     'inclusion': 'available',
-                    'table-key-properties': key_properties,
                     'selected': True,
                     'replication-key': replication_key,
-                    'table-name': table.table_id,
+                    'table-name': full_table_id,
                     'table-created-at': utils.strftime(table.created),
                     'table-labels': table.labels,
                     'table-partition-size': partition_size.total_seconds(),
@@ -97,8 +97,8 @@ def discover(config, client):
             ]
             streams.append(
                 CatalogEntry(
-                    tap_stream_id=table.full_table_id,
-                    stream=table.table_id,
+                    tap_stream_id=full_table_id.replace(".", "__"),
+                    stream=full_table_id.replace(".", "__"),
                     schema=schema,
                     key_properties=key_properties,
                     metadata=stream_metadata,
@@ -108,7 +108,7 @@ def discover(config, client):
                     table=None,
                     row_count=None,
                     stream_alias=None,
-                    replication_method=None,
+                    replication_method='INCREMENTAL',
                 )
             )
 
@@ -121,42 +121,49 @@ def sync(config, state, catalog, client):
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
 
-        bookmark_column = stream.replication_key
-
-        limit = config.get('step', 10000)
-
-        import pdb; pdb.set_trace()
-
+        schema = stream.schema.to_dict()
         singer.write_schema(
             stream_name=stream.tap_stream_id,
-            schema=stream.schema,
+            schema=schema,
             key_properties=stream.key_properties,
         )
 
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
+        base_metadata = metadata.to_map(stream.metadata)[()]
+        table_name = base_metadata['table-name']
+        step = timedelta(seconds=base_metadata['table-partition-size'])
+
         with Transformer() as transformer:
-            while True:
+            while start_date < datetime.datetime.now(timezone.utc):
                 params = {
-                    'table': stream.tap_stream_id,
-                    'bookmark_column': bookmark_column,
+                    'table_name': table_name,
+                    'replication_key': stream.replication_key,
                     'start_date': start_date,
-                    'limit': limit,
+                    'end_date': start_date + step
                 }
-                query = """SELECT * FROM {table} WHERE {bookmark_column} > timestamp {start_date} ORDER BY {bookmark_column}""".format(**params)
+                query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
                 LOGGER.info("Running query:\n    %s" % query)
                 query_job = client.query(query)
 
-                # query_job.result(page_size=,retry=,timeout=)
                 for row in query_job:
                     record = { k: v for k, v in row.items() }
-                    record = transformer.transform(row, stream.schema)
-                    start_date = utils.strftime(row[bookmark_column])
-                    singer.write_record(stream.tap_stream_id, row)
+                    record = deep_convert_datetimes(record)
+                    record = transformer.transform(record, schema)
+                    singer.write_record(stream.tap_stream_id, record)
 
-                singer.write_state({stream.tap_stream_id: start_date})
+                state[stream.tap_stream_id] = start_date.isoformat()
+                singer.write_state(state)
+                start_date += step
 
-                if query_job.total_rows < limit:
-                    break
+
+def deep_convert_datetimes(value):
+    if isinstance(value, list):
+        return [deep_convert_datetimes(child) for child in value]
+    elif isinstance(value, dict):
+        return {k: deep_convert_datetimes(v) for k, v in value.items()}
+    elif isinstance(value, datetime.date) or isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return value
 
 
 @utils.handle_top_exception(LOGGER)

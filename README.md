@@ -9,7 +9,7 @@ pip install git+https://github.com/fixdapp/tap-bigquery.git
 ```
 
 This tap supports discovery and state. It currently only supports tables that are time-paritioned. However,
-supporting other kinds of tables should be relatively straightforward and we will accept contributions. State is emitted per-partition, requiring only one read per partition. It supports detecting tables and schemas via discovery, but it cannot reliably detect key_properties, so you will want to specify those in the catalog.
+supporting other kinds of tables should be relatively straightforward and we will accept contributions. State is emitted per-partition, requiring only one read per partition to minimize charges for data access. It supports detecting tables and schemas via discovery, but it cannot reliably detect key_properties, so you will want to specify those in the catalog.
 
 ## Config
 

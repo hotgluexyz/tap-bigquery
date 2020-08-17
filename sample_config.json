@@ -1,5 +1,5 @@
 {
-  "username": "my_username",
-  "password": "my_password",
-  "start_date": "2017-01-01T00:00:00Z"
+  "project": "foobar-12345",
+  "credentials_path": "./google-service-account-credentials.json",
+  "start_date": "2020-01-01T00:00:00Z"
 }
