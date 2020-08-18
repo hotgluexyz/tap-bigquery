@@ -3,6 +3,8 @@ import os
 import json
 import singer
 import datetime
+import urllib3
+import requests
 from datetime import timedelta, timezone
 from singer import Transformer, utils, metadata
 from singer.catalog import Catalog, CatalogEntry
@@ -160,7 +162,13 @@ def sync(config, state, catalog, client):
 
 
 def retryable_error(exception):
-    return retry.if_transient_error(exception) or retry.if_exception_type(requests.exceptions.Timeout)
+    if retry.if_transient_error(exception):
+        return True
+
+    return retry.if_exception_type(
+        requests.exceptions.Timeout,
+        urllib3.exceptions.TimeoutError,
+    )
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
