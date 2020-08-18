@@ -9,6 +9,7 @@ from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
 
 from google.oauth2 import service_account
+from google.api_core import retry
 from google.cloud import bigquery
 
 REQUIRED_CONFIG_KEYS = ['start_date', 'project', 'credentials_path']
@@ -95,10 +96,11 @@ def discover(config, client):
                   'breadcrumb': []
                 }
             ]
+            stream_name = full_table_id.replace(".", "__").replace('-', '_')
             streams.append(
                 CatalogEntry(
-                    tap_stream_id=full_table_id.replace(".", "__"),
-                    stream=full_table_id.replace(".", "__"),
+                    tap_stream_id=stream_name,
+                    stream=table.table_id,
                     schema=schema,
                     key_properties=key_properties,
                     metadata=stream_metadata,
@@ -122,8 +124,9 @@ def sync(config, state, catalog, client):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
 
         schema = stream.schema.to_dict()
+        stream_name = stream.table or stream.stream or stream.tap_stream_id
         singer.write_schema(
-            stream_name=stream.tap_stream_id,
+            stream_name=stream_name,
             schema=schema,
             key_properties=stream.key_properties,
         )
@@ -143,18 +146,21 @@ def sync(config, state, catalog, client):
                 }
                 query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
                 LOGGER.info("Running query:\n    %s" % query)
-                query_job = client.query(query)
+                query_job = client.query(query, retry=retry.Retry(predicate=retryable_error))
 
                 for row in query_job:
                     record = { k: v for k, v in row.items() }
                     record = deep_convert_datetimes(record)
                     record = transformer.transform(record, schema)
-                    singer.write_record(stream.tap_stream_id, record)
+                    singer.write_record(stream_name, record)
 
                 state[stream.tap_stream_id] = start_date.isoformat()
                 singer.write_state(state)
                 start_date += step
 
+
+def retryable_error(exception):
+    return retry.if_transient_error(exception) or retry.if_exception_type(requests.exceptions.Timeout)
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
