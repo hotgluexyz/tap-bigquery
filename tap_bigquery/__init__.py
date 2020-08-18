@@ -158,7 +158,7 @@ def sync(config, state, catalog, client):
 
                 state[stream.tap_stream_id] = start_date.isoformat()
                 singer.write_state(state)
-                start_date += step
+                start_date = round_to_partition(start_date + step, step)
 
 
 def retryable_error(exception):
@@ -178,6 +178,14 @@ def deep_convert_datetimes(value):
     elif isinstance(value, datetime.date) or isinstance(value, datetime.datetime):
         return value.isoformat()
     return value
+
+def round_to_partition(datetime, step):
+    if step == timedelta(days=1):
+        return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+    if step == timedelta(hours=1):
+        return datetime.replace(minute=0, second=0, microsecond=0)
+    else:
+        raise NotImplementedError(f"Unsupported partition type: {step}")
 
 
 @utils.handle_top_exception(LOGGER)
