@@ -148,7 +148,7 @@ def sync(config, state, catalog, client):
                 }
                 query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
                 LOGGER.info("Running query:\n    %s" % query)
-                query_job = client.query(query, retry=retry.Retry(predicate=retryable_error))
+                query_job = client.query(query, retry=retry.Retry(predicate=retryable_error,on_error=LOGGER.warn))
 
                 for row in query_job:
                     record = { k: v for k, v in row.items() }
@@ -166,8 +166,9 @@ def retryable_error(exception):
         return True
 
     return retry.if_exception_type(
-        requests.exceptions.Timeout,
-        urllib3.exceptions.TimeoutError,
+        requests.exceptions.RequestException,
+        urllib3.exceptions.HTTPError,
+        TimeoutError,
     )
 
 def deep_convert_datetimes(value):
