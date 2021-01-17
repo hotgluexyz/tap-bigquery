@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import os
+import time
 import json
 import singer
 import datetime
 import urllib3
 import requests
+from socket import error as SocketError
+from socket import timeout as SocketTimeout
+from ssl import SSLError as BaseSSLError
 from datetime import timedelta, timezone
 from singer import Transformer, utils, metadata
 from singer.catalog import Catalog, CatalogEntry
@@ -147,29 +151,30 @@ def sync(config, state, catalog, client):
                     'end_date': start_date + step
                 }
                 query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
-                LOGGER.info("Running query:\n    %s" % query)
-                query_job = client.query(query, retry=retry.Retry(predicate=retryable_error,on_error=LOGGER.warn))
+                attempts = 0
+                while True:
+                    try:
+                        LOGGER.info("Running query:\n    %s" % query)
+                        query_job = client.query(query)
 
-                for row in query_job:
-                    record = { k: v for k, v in row.items() }
-                    record = deep_convert_datetimes(record)
-                    record = transformer.transform(record, schema)
-                    singer.write_record(stream_name, record)
+                        for row in query_job:
+                            record = { k: v for k, v in row.items() }
+                            record = deep_convert_datetimes(record)
+                            record = transformer.transform(record, schema)
+                            singer.write_record(stream_name, record)
+                        break
+                    except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
+                        LOGGER.warn(e)
+                        attempts += 1
+                        if attempts > 3:
+                            time.sleep(2**attempts)
+                            pass
+                        raise e
 
                 state[stream.tap_stream_id] = start_date.isoformat()
                 singer.write_state(state)
                 start_date = round_to_partition(start_date + step, step)
 
-
-def retryable_error(exception):
-    if retry.if_transient_error(exception):
-        return True
-
-    return retry.if_exception_type(
-        requests.exceptions.RequestException,
-        urllib3.exceptions.HTTPError,
-        TimeoutError,
-    )
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
