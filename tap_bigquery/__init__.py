@@ -137,6 +137,14 @@ def parse_args():
     args = parser.parse_args()
     if args.config:
         args.config = singer_utils.load_json(args.config)
+
+        limit = args.config.get("limit")
+        if type(limit) == str:
+            args.config["limit"] = int(limit)
+
+        streams = args.config.get("streams")
+        if type(streams) == str:
+            args.config["streams"] = json.loads(streams)
     if args.state:
         args.state = singer_utils.load_json(args.state)
     else:

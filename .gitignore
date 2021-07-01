@@ -1,4 +1,5 @@
 install_test
+hidden-tests
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
