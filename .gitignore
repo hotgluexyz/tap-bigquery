@@ -1,3 +1,4 @@
+.secrets/
 google-service-account-credentials.json
 
 # Byte-compiled / optimized / DLL files

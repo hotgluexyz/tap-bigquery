@@ -29,6 +29,7 @@ TYPE_MAP = {
     'INT64': { 'type': 'integer' },
     'FLOAT': { 'type': 'number', 'format': 'float' },
     'FLOAT64': { 'type': 'number', 'format': 'float' },
+    'NUMERIC': { 'type': 'number', 'format': 'float' },
     'TIMESTAMP': { 'type': 'string', 'format': 'date-time' },
     'DATETIME': { 'type': 'string', 'format': 'date-time' },
     'DATE': { 'type': 'string', 'format': 'date' },
@@ -65,60 +66,84 @@ def discover(config, client):
 
     for dataset in client.list_datasets(project):
         for t in client.list_tables(dataset.dataset_id):
-            if not t.time_partitioning:
-                LOGGER.info(f"Skipping table {t.full_table_id}: Currently only time-partitioned tables are supported")
-                continue
-
             full_table_id = f"{project}.{dataset.dataset_id}.{t.table_id}"
 
             # Load the full table details to get the schema
             table = client.get_table(full_table_id)
+            partition_type = None
+            partition_size = None
+            replication_key = None
 
-            partition_type = table.time_partitioning.type_
-            if partition_type == 'DAY':
-                partition_size = timedelta(days=1) 
-            elif partition_type == 'HOUR':
-                partition_size = timedelta(hour=1) 
-            else:
-                raise NotImplementedError(f"Unsupported partition type: {partition_type}")
+            if t.time_partitioning:
+                replication_key = table.time_partitioning.field
+                partition_type = table.time_partitioning.type_
+
+                if partition_type == 'DAY':
+                    partition_size = timedelta(days=1)
+                elif partition_type == 'HOUR':
+                    partition_size = timedelta(hour=1)
+                else:
+                    LOGGER.info(f"Skipping table {t.full_table_id}: Unsupported partition type: {partition_type}")
+                    continue
 
             schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
 
             # Try and guess required properties by looking for required fields that end in "id"
             # if this doesn't work, users can always specify their own key-properties with catalog
             key_properties = [s.name for s in table.schema if s.mode == 'REQUIRED' and s.name.lower().endswith("id")]
-            replication_key = table.time_partitioning.field
-            stream_metadata = [
-                {
-                  'metadata': {
-                    'inclusion': 'available',
-                    'selected': True,
-                    'replication-key': replication_key,
-                    'table-name': full_table_id,
-                    'table-created-at': utils.strftime(table.created),
-                    'table-labels': table.labels,
-                    'table-partition-size': partition_size.total_seconds(),
-                  },
-                  'breadcrumb': []
-                }
-            ]
+            metadata = {
+                'inclusion': 'available',
+                'selected': True,
+                'table-name': full_table_id,
+                'table-created-at': utils.strftime(table.created),
+                'table-labels': table.labels,
+            }
+
+            if replication_key is not None:
+                metadata['replication-key'] = replication_key
+
+            if partition_size is not None:
+                metadata['table-partition-size'] = partition_size.total_seconds(),
+
+            stream_metadata = [{
+                'metadata': metadata,
+                'breadcrumb': []
+            }]
+
             stream_name = full_table_id.replace(".", "__").replace('-', '_')
-            streams.append(
-                CatalogEntry(
-                    tap_stream_id=stream_name,
-                    stream=table.table_id,
-                    schema=schema,
-                    key_properties=key_properties,
-                    metadata=stream_metadata,
-                    replication_key=replication_key,
-                    is_view=None,
-                    database=None,
-                    table=None,
-                    row_count=None,
-                    stream_alias=None,
-                    replication_method='INCREMENTAL',
+            if replication_key is not None:
+                streams.append(
+                    CatalogEntry(
+                        tap_stream_id=stream_name,
+                        stream=f"{dataset.dataset_id}_{table.table_id}",
+                        schema=schema,
+                        key_properties=key_properties,
+                        metadata=stream_metadata,
+                        replication_key=replication_key,
+                        is_view=None,
+                        database=None,
+                        table=None,
+                        row_count=None,
+                        stream_alias=None,
+                        replication_method='INCREMENTAL',
+                    )
                 )
-            )
+            else:
+                streams.append(
+                    CatalogEntry(
+                        tap_stream_id=stream_name,
+                        stream=f"{dataset.dataset_id}_{table.table_id}",
+                        schema=schema,
+                        key_properties=key_properties,
+                        metadata=stream_metadata,
+                        is_view=None,
+                        database=None,
+                        table=None,
+                        row_count=None,
+                        stream_alias=None,
+                        replication_method='FULL_TABLE',
+                    )
+                )
 
     return Catalog(streams)
 
@@ -140,17 +165,50 @@ def sync(config, state, catalog, client):
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata['table-name']
-        step = timedelta(seconds=base_metadata['table-partition-size'])
 
-        with Transformer() as transformer:
-            while start_date < datetime.datetime.now(timezone.utc):
+        LOGGER.info(stream.replication_key)
+
+        if stream.replication_key is not None:
+            step = timedelta(seconds=base_metadata['table-partition-size'])
+
+            with Transformer() as transformer:
+                while start_date < datetime.datetime.now(timezone.utc):
+                    params = {
+                        'table_name': table_name,
+                        'replication_key': stream.replication_key,
+                        'start_date': start_date,
+                        'end_date': start_date + step
+                    }
+                    query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
+                    attempts = 0
+                    while True:
+                        try:
+                            LOGGER.info("Running query:\n    %s" % query)
+                            query_job = client.query(query)
+
+                            for row in query_job:
+                                record = { k: v for k, v in row.items() }
+                                record = deep_convert_datetimes(record)
+                                record = transformer.transform(record, schema)
+                                singer.write_record(stream_name, record)
+                            break
+                        except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
+                            LOGGER.warn(e)
+                            attempts += 1
+                            if attempts > 3:
+                                time.sleep(2**attempts)
+                                pass
+                            raise e
+
+                    state[stream.tap_stream_id] = start_date.isoformat()
+                    singer.write_state(state)
+                    start_date = round_to_partition(start_date + step, step)
+        else:
+            with Transformer() as transformer:
                 params = {
-                    'table_name': table_name,
-                    'replication_key': stream.replication_key,
-                    'start_date': start_date,
-                    'end_date': start_date + step
+                    'table_name': table_name
                 }
-                query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
+                query = """SELECT * FROM `{table_name}`""".format(**params)
                 attempts = 0
                 while True:
                     try:
@@ -171,9 +229,8 @@ def sync(config, state, catalog, client):
                             pass
                         raise e
 
-                state[stream.tap_stream_id] = start_date.isoformat()
-                singer.write_state(state)
-                start_date = round_to_partition(start_date + step, step)
+                    state[stream.tap_stream_id] = start_date.isoformat()
+                    singer.write_state(state)
 
 
 def deep_convert_datetimes(value):
