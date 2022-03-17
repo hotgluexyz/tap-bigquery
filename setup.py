@@ -10,9 +10,9 @@ setup(
     classifiers=["Programming Language :: Python :: 3 :: Only"],
     py_modules=["tap_bigquery"],
     install_requires=[
-        "singer-python>=5.0.12",
-        "requests",
-        "google-cloud-bigquery>=1.26.1"
+        "singer-python==5.12.1",
+        "requests==2.25.1",
+        "google-cloud-bigquery==2.20.0"
     ],
     entry_points="""
     [console_scripts]
