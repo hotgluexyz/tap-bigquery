@@ -64,6 +64,70 @@ def discover(config, client):
     project = config["project"]
     streams = []
 
+    for query in config.get("queries", []):
+        # for each query define the schema of the query based on the fields in the query
+        # and the type of the fields
+        query = query.copy()
+        query_name = query.pop("name")
+        query_sql = query.pop("sql")
+
+        if query_sql.endswith(";"):
+            query_sql = query_sql[:-1]
+
+        mod_query_sql = f"{query_sql} LIMIT 1"
+
+        results = client.query(mod_query_sql).result()
+        original_row = {}
+
+        for row in results:
+            original_row = dict(row)
+            schema = {
+                "type": "object", "properties": {
+                    k: {
+                        'type': ['string', 'null'],
+                        "description": None
+                    } for k in original_row.keys()
+                }
+            }
+
+        schema = Schema.from_dict(schema)
+        stream_metadata = [{
+            'metadata': {
+                'inclusion': 'available',
+                'selected': True,
+                'table-name': query_name,
+                'query': query_sql
+            },
+            'breadcrumb': []
+        }] + [
+            {
+                'breadcrumb': [
+                    'properties',
+                    f
+                ],
+                'metadata': {
+                    'inclusion': 'available',
+                    'selected-by-default': True,
+                },
+            } for f in original_row.keys()
+        ]
+
+        streams.append(
+            CatalogEntry(
+                tap_stream_id=query_name,
+                stream=query_name,
+                schema=schema,
+                key_properties=[],
+                metadata=stream_metadata,
+                is_view=None,
+                database=None,
+                table=None,
+                row_count=None,
+                stream_alias=None,
+                replication_method='FULL_TABLE',
+            )
+        )
+
     for dataset in client.list_datasets(project):
         for t in client.list_tables(dataset.dataset_id):
             full_table_id = f"{project}.{dataset.dataset_id}.{t.table_id}"
@@ -91,6 +155,18 @@ def discover(config, client):
             # Try and guess required properties by looking for required fields that end in "id"
             # if this doesn't work, users can always specify their own key-properties with catalog
             key_properties = [s.name for s in table.schema if s.mode == 'REQUIRED' and s.name.lower().endswith("id")]
+            additional_metadata = [
+                {
+                    'breadcrumb': [
+                        'properties',
+                        s.name
+                    ],
+                    'metadata': {
+                        'inclusion': 'available',
+                        'selected-by-default': True,
+                    },
+                } for s in table.schema
+            ]
             metadata = {
                 'inclusion': 'available',
                 'selected': True,
@@ -108,7 +184,7 @@ def discover(config, client):
             stream_metadata = [{
                 'metadata': metadata,
                 'breadcrumb': []
-            }]
+            }] + additional_metadata
 
             stream_name = full_table_id.replace(".", "__").replace('-', '_')
             if replication_key is not None:
@@ -164,9 +240,11 @@ def sync(config, state, catalog, client):
 
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
         base_metadata = metadata.to_map(stream.metadata)[()]
-        table_name = base_metadata['table-name']
+        table_name = base_metadata.get('table-name')
+        query = base_metadata.get('query')
 
-        LOGGER.info(stream.replication_key)
+        if stream.replication_key is not None:
+            LOGGER.info(f"Stream replication key: {stream.replication_key}")
 
         if stream.replication_key is not None:
             step = timedelta(seconds=base_metadata['table-partition-size'])
@@ -205,10 +283,16 @@ def sync(config, state, catalog, client):
                     start_date = round_to_partition(start_date + step, step)
         else:
             with Transformer() as transformer:
-                params = {
-                    'table_name': table_name
-                }
-                query = """SELECT * FROM `{table_name}`""".format(**params)
+                if query is not None:
+                    query = query
+                elif table_name is not None:
+                    params = {
+                        'table_name': table_name
+                    }
+                    query = """SELECT * FROM `{table_name}`""".format(**params)
+                else:
+                    raise ValueError("Either table-name or query must be provided in metadata")
+
                 attempts = 0
                 while True:
                     try:
@@ -219,6 +303,12 @@ def sync(config, state, catalog, client):
                             record = { k: v for k, v in row.items() }
                             record = deep_convert_datetimes(record)
                             record = transformer.transform(record, schema)
+
+                            # adds only selected fields to record
+                            selected_fields = [i["breadcrumb"][-1] for i in stream.metadata[1:] if i["metadata"]["selected"]]
+                            record = {k: v for k, v in record.items() if k in selected_fields}
+
+                            # writes the record
                             singer.write_record(stream_name, record)
                         break
                     except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
