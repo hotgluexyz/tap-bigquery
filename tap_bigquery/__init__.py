@@ -43,7 +43,7 @@ def convert_schemafield_to_jsonschema(schemafields):
     for schemafield in schemafields:
         if schemafield.field_type in TYPE_MAP:
             jsonschema['properties'][schemafield.name] = TYPE_MAP[schemafield.field_type].copy()
-        elif schemafield.field_type == 'RECORD' or schemafield.field_type == 'STRUCT':
+        elif schemafield.field_type == 'RECORD' or schemafield.field_type == 'STRUCT' or schemafield.field_type == 'JSON':
             jsonschema['properties'][schemafield.name] = convert_schemafield_to_jsonschema(schemafield.fields)
         else:
             raise NotImplementedError(f"Field type not supported: {schemafield.field_type}")
@@ -69,7 +69,7 @@ def discover(config, client):
         # and the type of the fields
         query = query.copy()
         query_name = query.pop("name")
-        query_sql = query.pop("sql")
+        query_sql = query.pop("query")
 
         if query_sql.endswith(";"):
             query_sql = query_sql[:-1]
