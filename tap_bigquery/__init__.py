@@ -76,6 +76,14 @@ def discover(config, client):
 
         mod_query_sql = f"{query_sql} LIMIT 1"
 
+        if "{replication_key_condition}" in query_sql:
+            replication_key = query.get("replication_key_field")
+            if replication_key is None:
+                raise ValueError("replication_key_field must be provided when using {replication_key_condition}")
+
+            start_date = config.get("start_date")
+            mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >= timestamp '{start_date}'")
+
         results = client.query(mod_query_sql).result()
         original_row = {}
 
@@ -112,6 +120,9 @@ def discover(config, client):
             } for f in original_row.keys()
         ]
 
+        replication_method = "FULL_TABLE" if not "{replication_key_condition}" in query_sql else "INCREMENTAL"
+        replication_key_field = query.get("replication_key_field")
+
         streams.append(
             CatalogEntry(
                 tap_stream_id=query_name,
@@ -124,9 +135,14 @@ def discover(config, client):
                 table=None,
                 row_count=None,
                 stream_alias=None,
-                replication_method='FULL_TABLE',
+                replication_method=replication_method,
+                replication_key=replication_key_field
             )
         )
+
+
+    if config.get('only_discover_queries', False):
+        return Catalog(streams)
 
     for dataset in client.list_datasets(project):
         for t in client.list_tables(dataset.dataset_id):
@@ -241,13 +257,14 @@ def sync(config, state, catalog, client):
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata.get('table-name')
-        query = base_metadata.get('query')
+        original_query = base_metadata.get('query')
 
         if stream.replication_key is not None:
             LOGGER.info(f"Stream replication key: {stream.replication_key}")
-
-        if stream.replication_key is not None:
-            step = timedelta(seconds=base_metadata['table-partition-size'])
+            if base_metadata.get('table-partition-size'):
+                step = timedelta(seconds=base_metadata.get('table-partition-size'))
+            else:
+                step = timedelta(days=1)
 
             with Transformer() as transformer:
                 while start_date < datetime.datetime.now(timezone.utc):
@@ -257,7 +274,11 @@ def sync(config, state, catalog, client):
                         'start_date': start_date,
                         'end_date': start_date + step
                     }
-                    query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
+                    if original_query is None:
+                        query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
+                    else:
+                        query = original_query.replace("{replication_key_condition}", "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'").format(**params)
+
                     attempts = 0
                     while True:
                         try:
