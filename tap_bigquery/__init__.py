@@ -258,6 +258,8 @@ def sync(config, state, catalog, client):
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata.get('table-name')
         original_query = base_metadata.get('query')
+        no_data_attempts = 0
+        written_records = False
 
         if stream.replication_key is not None:
             LOGGER.info(f"Stream replication key: {stream.replication_key}")
@@ -267,7 +269,7 @@ def sync(config, state, catalog, client):
                 step = timedelta(days=1)
 
             with Transformer() as transformer:
-                while start_date < datetime.datetime.now(timezone.utc):
+                while start_date < datetime.datetime.now(timezone.utc) or no_data_attempts < 3:
                     params = {
                         'table_name': table_name,
                         'replication_key': stream.replication_key,
@@ -280,12 +282,21 @@ def sync(config, state, catalog, client):
                         query = original_query.replace("{replication_key_condition}", "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'").format(**params)
 
                     attempts = 0
-                    while True:
+                    fetch_data = True if no_data_attempts < 3 else False
+                    while fetch_data:
                         try:
                             LOGGER.info("Running query:\n    %s" % query)
                             query_job = client.query(query)
+                            results = query_job.result()
 
-                            for row in query_job:
+                            if len(list(results)) == 0:
+                                no_data_attempts += 1
+                                break
+
+                            for idx, row in enumerate(query_job, start=1):
+                                if idx == 1:
+                                    written_records = True
+
                                 record = { k: v for k, v in row.items() }
                                 record = deep_convert_datetimes(record)
                                 record = transformer.transform(record, schema)
@@ -299,9 +310,14 @@ def sync(config, state, catalog, client):
                                 pass
                             raise e
 
-                    state[stream.tap_stream_id] = start_date.isoformat()
-                    singer.write_state(state)
+                    if written_records:
+                        state[stream.tap_stream_id] = start_date.isoformat()
+                        singer.write_state(state)
+                    else:
+                        no_data_attempts += 1
+
                     start_date = round_to_partition(start_date + step, step)
+
         else:
             with Transformer() as transformer:
                 if query is not None:
