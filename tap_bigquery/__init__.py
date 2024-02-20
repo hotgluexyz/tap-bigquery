@@ -282,8 +282,7 @@ def sync(config, state, catalog, client):
                         query = original_query.replace("{replication_key_condition}", "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'").format(**params)
 
                     attempts = 0
-                    fetch_data = True if no_data_attempts < 3 else False
-                    while fetch_data:
+                    while True:
                         try:
                             LOGGER.info("Running query:\n    %s" % query)
                             query_job = client.query(query)
@@ -320,8 +319,8 @@ def sync(config, state, catalog, client):
 
         else:
             with Transformer() as transformer:
-                if query is not None:
-                    query = query
+                if original_query is not None:
+                    query = original_query
                 elif table_name is not None:
                     params = {
                         'table_name': table_name
