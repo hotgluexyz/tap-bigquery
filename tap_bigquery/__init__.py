@@ -258,7 +258,7 @@ def sync(config, state, catalog, client):
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata.get('table-name')
         original_query = base_metadata.get('query')
-        no_data_attempts = 0
+        fetch_data = True
         written_records = False
 
         if stream.replication_key is not None:
@@ -268,38 +268,49 @@ def sync(config, state, catalog, client):
             else:
                 step = timedelta(days=1)
 
+            first_iteration = True
+            greatest_date = None
             with Transformer() as transformer:
-                while start_date < datetime.datetime.now(timezone.utc) or no_data_attempts < 3:
+                while start_date < datetime.datetime.now(timezone.utc) and fetch_data:
                     params = {
                         'table_name': table_name,
                         'replication_key': stream.replication_key,
                         'start_date': start_date,
                         'end_date': start_date + step
                     }
+
+                    replication_key_conditional = "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'"
+
+                    if first_iteration:
+                        replication_key_conditional = "{replication_key} >= timestamp '{start_date}' LIMIT 1000"
+
                     if original_query is None:
-                        query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
+                        query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
                     else:
-                        query = original_query.replace("{replication_key_condition}", "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'").format(**params)
+                        query = original_query.replace("{replication_key_condition}", replication_key_conditional).format(**params)
 
                     attempts = 0
-                    while True:
+                    while fetch_data:
                         try:
                             LOGGER.info("Running query:\n    %s" % query)
                             query_job = client.query(query)
                             results = query_job.result()
 
-                            if len(list(results)) == 0:
-                                no_data_attempts += 1
+                            if len(list(results)) == 0 and greatest_date is not None:
+                                fetch_data = False
                                 break
 
-                            for idx, row in enumerate(query_job, start=1):
-                                if idx == 1:
-                                    written_records = True
-
+                            for row in query_job:
                                 record = { k: v for k, v in row.items() }
                                 record = deep_convert_datetimes(record)
                                 record = transformer.transform(record, schema)
                                 singer.write_record(stream_name, record)
+
+                                if record.get(stream.replication_key) is not None:
+                                    record_date = datetime.datetime.fromisoformat(record[stream.replication_key])
+                                    if greatest_date is None or record_date > greatest_date:
+                                        greatest_date = record_date
+
                             break
                         except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
                             LOGGER.warn(e)
@@ -309,14 +320,15 @@ def sync(config, state, catalog, client):
                                 pass
                             raise e
 
-                    if written_records:
-                        state[stream.tap_stream_id] = start_date.isoformat()
-                        singer.write_state(state)
-                    else:
-                        no_data_attempts += 1
-
                     start_date = round_to_partition(start_date + step, step)
 
+                    if greatest_date:
+                        start_date = greatest_date + timedelta(seconds=1)
+
+                    first_iteration = False
+
+                state[stream.tap_stream_id] = start_date.isoformat()
+                singer.write_state(state)
         else:
             with Transformer() as transformer:
                 if original_query is not None:
@@ -373,6 +385,8 @@ def round_to_partition(datetime, step):
         return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     if step == timedelta(hours=1):
         return datetime.replace(minute=0, second=0, microsecond=0)
+    if step == timedelta(seconds=1):
+        return datetime + timedelta(seconds=1)
     else:
         raise NotImplementedError(f"Unsupported partition type: {step}")
 
