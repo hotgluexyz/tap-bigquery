@@ -91,7 +91,8 @@ def discover(config, client):
             LOGGER.error(f"Query: {query_sql}")
             raise
 
-        if len(list(results)) == 0:
+        results = list(results)
+        if len(results) == 0:
             raise ValueError(f"Query {query_name} returned no results, so it's impossible to infer the schema. Please check the query.")
 
         original_row = {}
