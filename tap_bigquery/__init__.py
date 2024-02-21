@@ -121,7 +121,7 @@ def discover(config, client):
         ]
 
         replication_method = "FULL_TABLE" if not "{replication_key_condition}" in query_sql else "INCREMENTAL"
-        replication_key_field = query.get("replication_key_field")
+        replication_key_field = query.get("replication_key_field") if replication_method == "INCREMENTAL" else None
 
         streams.append(
             CatalogEntry(
