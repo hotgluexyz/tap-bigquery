@@ -84,9 +84,19 @@ def discover(config, client):
             start_date = config.get("start_date")
             mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >= timestamp '{start_date}'")
 
-        results = client.query(mod_query_sql).result()
+        try:
+            results = client.query(mod_query_sql).result()
+        except Exception as e:
+            LOGGER.error(f"Error running query: {mod_query_sql}")
+            LOGGER.error(f"Query: {query_sql}")
+            raise
+
+        if len(list(results)) == 0:
+            raise ValueError(f"Query {query_name} returned no results, so it's impossible to infer the schema. Please check the query.")
+
         original_row = {}
 
+        schema = {}
         for row in results:
             original_row = dict(row)
             schema = {
