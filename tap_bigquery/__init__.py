@@ -289,11 +289,8 @@ def sync(config, state, catalog, client):
                         'start_date': start_date,
                         'end_date': start_date + step
                     }
-
-                    replication_key_conditional = "{replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}'"
-
-                    if first_iteration:
-                        replication_key_conditional = "{replication_key} >= timestamp '{start_date}' LIMIT 1000"
+                    
+                    replication_key_conditional = "{replication_key} >= timestamp '{start_date}' ORDER BY {replication_key} ASC"
 
                     if original_query is None:
                         query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
@@ -335,8 +332,6 @@ def sync(config, state, catalog, client):
 
                     if greatest_date:
                         start_date = greatest_date + timedelta(seconds=1)
-
-                    first_iteration = False
 
                 state[stream.tap_stream_id] = start_date.isoformat()
                 singer.write_state(state)
