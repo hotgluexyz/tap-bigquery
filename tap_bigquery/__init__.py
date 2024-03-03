@@ -86,7 +86,11 @@ def discover(config, client):
                     LOGGER.info(f"Skipping table {t.full_table_id}: Unsupported partition type: {partition_type}")
                     continue
 
-            schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
+            try:
+                schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
+            except:
+                LOGGER.exception(f"Skipping table {t.full_table_id}: Error:")
+                continue
 
             # Try and guess required properties by looking for required fields that end in "id"
             # if this doesn't work, users can always specify their own key-properties with catalog
