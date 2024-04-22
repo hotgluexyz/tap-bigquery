@@ -6,6 +6,8 @@ import singer
 import datetime
 import urllib3
 import requests
+import re
+import pytz
 from socket import error as SocketError
 from socket import timeout as SocketTimeout
 from ssl import SSLError as BaseSSLError
@@ -80,9 +82,26 @@ def discover(config, client):
             replication_key = query.get("replication_key_field")
             if replication_key is None:
                 raise ValueError("replication_key_field must be provided when using {replication_key_condition}")
+            
+            # infer type of rep_key
+            # get project_dataset
+            table_path = re.search(r'FROM `([^`]+)`', query_sql).group(1)
+            table_path = table_path.split(".")
+            project_dataset = '.'.join(table_path[:2])
+            bq_table_name = table_path[-1]
+            # query rep_key type
+            rep_key_query = f"SELECT data_type FROM `{project_dataset}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{bq_table_name}' AND column_name= '{replication_key}'"
+            query_job = client.query(rep_key_query)
+            results = query_job.result()
+            for row in results:
+                rep_key_type = row[0]     
 
-            start_date = config.get("start_date")
-            mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >= timestamp '{start_date}'")
+            if rep_key_type == "DATETIME":
+                start_date = config.get("start_date")
+                start_date = datetime.datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ')
+                # format datetime as accepted by BQ
+                start_date = start_date.strftime('%Y-%m-%d %H:%M:%S')
+            mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >=  {rep_key_type}('{start_date}')")
 
         try:
             results = client.query(mod_query_sql).result()
@@ -257,6 +276,7 @@ def sync(config, state, catalog, client):
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
 
+        rep_key_type = None
         schema = stream.schema.to_dict()
         stream_name = stream.table or stream.stream or stream.tap_stream_id
         singer.write_schema(
@@ -283,14 +303,38 @@ def sync(config, state, catalog, client):
             greatest_date = None
             with Transformer() as transformer:
                 while start_date < datetime.datetime.now(timezone.utc) and fetch_data:
+                    start_date = start_date
+                    end_date = start_date + step
                     params = {
                         'table_name': table_name,
                         'replication_key': stream.replication_key,
                         'start_date': start_date,
-                        'end_date': start_date + step
+                        'end_date': end_date
                     }
-                    
-                    replication_key_conditional = "{replication_key} >= timestamp '{start_date}' ORDER BY {replication_key} ASC"
+                    # check type of replication_key
+                    # get project.dataset
+                    table_path = re.search(r'FROM `([^`]+)`', original_query).group(1)
+                    table_path = table_path.split(".")
+                    project_dataset = '.'.join(table_path[:2])
+                    # get bigquery table name
+                    bq_table_name = table_path[-1]
+                    # add values to params to add them to the querys
+                    params["project_dataset"] = project_dataset
+                    params["bq_table_name"] = bq_table_name
+                    # get rep_key type from bigquery
+                    if not rep_key_type:
+                        rep_key_query = "SELECT data_type FROM `{project_dataset}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{bq_table_name}' AND column_name= '{replication_key}'".format(**params)
+                        query_job = client.query(rep_key_query)
+                        results = query_job.result()
+                        for row in results:
+                            rep_key_type = row[0]
+                    # add rep_key_type to params
+                    params["rep_key_type"] = rep_key_type  
+                    if rep_key_type == "DATETIME":
+                        params["start_date"] = start_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+                        params["end_date"] = end_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+                    replication_key_conditional = "{replication_key} >= {rep_key_type}('{start_date}') ORDER BY {replication_key} ASC;"
 
                     if original_query is None:
                         query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
@@ -331,6 +375,9 @@ def sync(config, state, catalog, client):
                     start_date = round_to_partition(start_date + step, step)
 
                     if greatest_date:
+                        utc_timezone = pytz.timezone('UTC')
+                        if greatest_date.tzinfo is None:
+                            greatest_date = utc_timezone.localize(greatest_date)
                         start_date = greatest_date + timedelta(seconds=1)
 
                 state[stream.tap_stream_id] = start_date.isoformat()
