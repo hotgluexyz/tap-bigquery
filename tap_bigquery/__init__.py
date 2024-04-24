@@ -269,6 +269,12 @@ def discover(config, client):
 
     return Catalog(streams)
 
+def localize_datetime(datetime):
+    utc_timezone = pytz.timezone('UTC')
+    if datetime.tzinfo is None:
+        datetime = utc_timezone.localize(datetime)
+    return datetime
+
 
 def sync(config, state, catalog, client):
     """ Sync data from tap source """
@@ -292,55 +298,115 @@ def sync(config, state, catalog, client):
         fetch_data = True
         written_records = False
 
+        # A. Logic for inc syncs streams
         if stream.replication_key is not None:
             LOGGER.info(f"Stream replication key: {stream.replication_key}")
+
+            step = None
             if base_metadata.get('table-partition-size'):
                 step = timedelta(seconds=base_metadata.get('table-partition-size'))
-            else:
-                step = timedelta(days=1)
 
-            first_iteration = True
-            greatest_date = None
             with Transformer() as transformer:
-                while start_date < datetime.datetime.now(timezone.utc) and fetch_data:
-                    start_date = start_date
-                    end_date = start_date + step
-                    params = {
+                params = {
+                    'table_name': table_name,
+                    'replication_key': stream.replication_key,
+                }
+
+                # Check type of replication_key
+                # get project.dataset
+                table_path = re.search(r'FROM `([^`]+)`', original_query).group(1)
+                table_path = table_path.split(".")
+                project_dataset = '.'.join(table_path[:2])
+                # get bigquery table name
+                bq_table_name = table_path[-1]
+                # add values to params to add them to the querys
+                params["project_dataset"] = project_dataset
+                params["bq_table_name"] = bq_table_name
+                # get rep_key type from bigquery
+                if not rep_key_type:
+                    rep_key_query = "SELECT data_type FROM `{project_dataset}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{bq_table_name}' AND column_name= '{replication_key}'".format(**params)
+                    query_job = client.query(rep_key_query)
+                    results = query_job.result()
+                    for row in results:
+                        rep_key_type = row[0]
+                # add rep_key_type to params
+                params["rep_key_type"] = rep_key_type 
+
+                # Logic for time partitioned table streams
+                if step:
+                    now = datetime.datetime.now(timezone.utc)
+                    now = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    while start_date < now and fetch_data:
+                        # prepare params
+                        end_date = start_date + step
+                        params.update({
+                            'start_date': start_date,
+                            'end_date': end_date
+                        })
+ 
+                        if rep_key_type == "DATETIME":
+                            params["start_date"] = start_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+                            params["end_date"] = end_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+                        # prepare query
+                        replication_key_conditional = "{replication_key} > {rep_key_type}('{start_date}') AND {replication_key} <= {rep_key_type}('{end_date}')  ORDER BY {replication_key} ASC;"
+
+                        if original_query is None:
+                            query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
+                        else:
+                            query = original_query.replace("{replication_key_condition}", replication_key_conditional).format(**params)
+
+                        attempts = 0
+                        while True:
+                            try:
+                                LOGGER.info("Running query:\n    %s" % query)
+                                query_job = client.query(query)
+                                results = query_job.result()
+
+                                for row in query_job:
+                                    record = { k: v for k, v in row.items() }
+                                    record = deep_convert_datetimes(record)
+                                    record = transformer.transform(record, schema)
+                                    singer.write_record(stream_name, record)
+                                break
+                            except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
+                                LOGGER.warn(e)
+                                attempts += 1
+                                if attempts > 3:
+                                    time.sleep(2**attempts)
+                                    pass
+                                raise e
+
+                        # increase the start_date by the step (partition time)
+                        start_date = round_to_partition(start_date + step, step)
+
+                    state[stream.tap_stream_id] = start_date.isoformat()
+                    singer.write_state(state)
+        
+                # Logic for non time partitioned tables with rep_key
+                else:
+                    #1. Get params for query
+                    params.update({
                         'table_name': table_name,
                         'replication_key': stream.replication_key,
                         'start_date': start_date,
-                        'end_date': end_date
-                    }
-                    # check type of replication_key
-                    # get project.dataset
-                    table_path = re.search(r'FROM `([^`]+)`', original_query).group(1)
-                    table_path = table_path.split(".")
-                    project_dataset = '.'.join(table_path[:2])
-                    # get bigquery table name
-                    bq_table_name = table_path[-1]
-                    # add values to params to add them to the querys
-                    params["project_dataset"] = project_dataset
-                    params["bq_table_name"] = bq_table_name
-                    # get rep_key type from bigquery
-                    if not rep_key_type:
-                        rep_key_query = "SELECT data_type FROM `{project_dataset}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{bq_table_name}' AND column_name= '{replication_key}'".format(**params)
-                        query_job = client.query(rep_key_query)
-                        results = query_job.result()
-                        for row in results:
-                            rep_key_type = row[0]
-                    # add rep_key_type to params
-                    params["rep_key_type"] = rep_key_type  
+                    })
+
+                    # greates_date will be used to write to the state, it starts beign the same as the start_date
+                    greatest_date = start_date
+
+                    #2. Fromat start_date if rep_key is datetime
                     if rep_key_type == "DATETIME":
                         params["start_date"] = start_date.strftime("%Y-%m-%d %H:%M:%S.%f")
-                        params["end_date"] = end_date.strftime("%Y-%m-%d %H:%M:%S.%f")
 
+                    #3. Build rep_key conditional no limits, no iteration, this was faster than iterating by day
                     replication_key_conditional = "{replication_key} >= {rep_key_type}('{start_date}') ORDER BY {replication_key} ASC;"
 
                     if original_query is None:
                         query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
                     else:
                         query = original_query.replace("{replication_key_condition}", replication_key_conditional).format(**params)
-
+                
                     attempts = 0
                     while fetch_data:
                         try:
@@ -348,18 +414,16 @@ def sync(config, state, catalog, client):
                             query_job = client.query(query)
                             results = query_job.result()
 
-                            if len(list(results)) == 0 and greatest_date is not None:
-                                fetch_data = False
-                                break
-
                             for row in query_job:
                                 record = { k: v for k, v in row.items() }
                                 record = deep_convert_datetimes(record)
                                 record = transformer.transform(record, schema)
                                 singer.write_record(stream_name, record)
 
+                                greatest_date = localize_datetime(greatest_date)
                                 if record.get(stream.replication_key) is not None:
                                     record_date = datetime.datetime.fromisoformat(record[stream.replication_key])
+                                    record_date = localize_datetime(record_date)
                                     if greatest_date is None or record_date > greatest_date:
                                         greatest_date = record_date
 
@@ -372,16 +436,10 @@ def sync(config, state, catalog, client):
                                 pass
                             raise e
 
-                    start_date = round_to_partition(start_date + step, step)
-
-                    if greatest_date:
-                        utc_timezone = pytz.timezone('UTC')
-                        if greatest_date.tzinfo is None:
-                            greatest_date = utc_timezone.localize(greatest_date)
-                        start_date = greatest_date + timedelta(seconds=1)
-
-                state[stream.tap_stream_id] = start_date.isoformat()
-                singer.write_state(state)
+                    state[stream.tap_stream_id] = greatest_date.isoformat()
+                    singer.write_state(state)
+                
+        # B. Logic for fullsync streams
         else:
             with Transformer() as transformer:
                 if original_query is not None:
