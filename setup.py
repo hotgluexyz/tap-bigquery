@@ -12,7 +12,8 @@ setup(
     install_requires=[
         "singer-python==5.12.1",
         "requests==2.25.1",
-        "google-cloud-bigquery==2.30.0"
+        "google-cloud-bigquery==2.30.0",
+        "pendulum==3.0.0"
     ],
     entry_points="""
     [console_scripts]
