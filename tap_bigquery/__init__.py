@@ -15,6 +15,7 @@ from datetime import timedelta, timezone
 from singer import Transformer, utils, metadata
 from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
+from pendulum import parse
 
 from google.oauth2 import service_account
 from google.api_core import retry
@@ -349,7 +350,10 @@ def sync(config, state, catalog, client):
                             params["end_date"] = end_date.strftime("%Y-%m-%d %H:%M:%S.%f")
 
                         # prepare query
-                        replication_key_conditional = "{replication_key} > {rep_key_type}('{start_date}') AND {replication_key} <= {rep_key_type}('{end_date}')  ORDER BY {replication_key} ASC;"
+                        if rep_key_type.lower() not in ["datetime", "timestamp", "date"]:   
+                            replication_key_conditional = "{replication_key} > '{start_date}' AND {replication_key} <= '{end_date}'  ORDER BY {replication_key} ASC;"
+                        else:
+                            replication_key_conditional = "{replication_key} > {rep_key_type}('{start_date}') AND {replication_key} <= {rep_key_type}('{end_date}')  ORDER BY {replication_key} ASC;"
 
                         if original_query is None:
                             query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
@@ -395,13 +399,17 @@ def sync(config, state, catalog, client):
                     # greates_date will be used to write to the state, it starts beign the same as the start_date
                     greatest_date = start_date
 
-                    #2. Fromat start_date if rep_key is datetime
+                    #2. Format query rep key depending on the type
                     if rep_key_type == "DATETIME":
                         params["start_date"] = start_date.strftime("%Y-%m-%d %H:%M:%S.%f")
 
-                    #3. Build rep_key conditional no limits, no iteration, this was faster than iterating by day
-                    replication_key_conditional = "{replication_key} >= {rep_key_type}('{start_date}') ORDER BY {replication_key} ASC;"
+                    #3. Build rep_key conditional no limits, no iteration, this was faster than iterating by day           
+                    if rep_key_type.lower() in ["datetime", "timestamp", "date"]:   
+                        replication_key_conditional = "{replication_key} >= {rep_key_type}('{start_date}') ORDER BY {replication_key} ASC;"
+                    else:
+                        replication_key_conditional = "{replication_key} >= '{start_date}' ORDER BY {replication_key} ASC;"
 
+                    #4 build full query
                     if original_query is None:
                         query = ("""SELECT * FROM `{table_name}` WHERE""" + replication_key_conditional).format(**params)
                     else:
@@ -422,7 +430,7 @@ def sync(config, state, catalog, client):
 
                                 greatest_date = localize_datetime(greatest_date)
                                 if record.get(stream.replication_key) is not None:
-                                    record_date = datetime.datetime.fromisoformat(record[stream.replication_key])
+                                    record_date = parse(record[stream.replication_key])
                                     record_date = localize_datetime(record_date)
                                     if greatest_date is None or record_date > greatest_date:
                                         greatest_date = record_date
