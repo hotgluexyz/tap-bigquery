@@ -96,13 +96,17 @@ def discover(config, client):
             results = query_job.result()
             for row in results:
                 rep_key_type = row[0]     
-
+            
+            start_date = config.get("start_date")
             if rep_key_type == "DATETIME":
-                start_date = config.get("start_date")
                 start_date = datetime.datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ')
                 # format datetime as accepted by BQ
                 start_date = start_date.strftime('%Y-%m-%d %H:%M:%S')
-            mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >=  {rep_key_type}('{start_date}')")
+            
+            if rep_key_type.lower() in ["datetime", "timestamp", "date"]:
+                mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >=  {rep_key_type}('{start_date}')")   
+            else:
+                mod_query_sql = mod_query_sql.replace("{replication_key_condition}", f"{replication_key} >=  '{start_date}'")
 
         try:
             results = client.query(mod_query_sql).result()
