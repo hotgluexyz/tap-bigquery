@@ -176,7 +176,8 @@ def sync(config, state, catalog, client):
         LOGGER.info(stream.replication_key)
 
         if stream.replication_key is not None:
-            step = timedelta(seconds=base_metadata['table-partition-size'])
+            step_sec = base_metadata['table-partition-size'][0] if type(base_metadata['table-partition-size']) == list else base_metadata['table-partition-size']
+            step = timedelta(seconds=step_sec)
 
             with Transformer() as transformer:
                 while start_date < datetime.datetime.now(timezone.utc):
@@ -254,6 +255,8 @@ def round_to_partition(datetime, step):
         return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     if step == timedelta(hours=1):
         return datetime.replace(minute=0, second=0, microsecond=0)
+    if step == timedelta(weeks=4):
+        return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         raise NotImplementedError(f"Unsupported partition type: {step}")
 
