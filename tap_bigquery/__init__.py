@@ -83,8 +83,8 @@ def discover(config, client):
                 elif partition_type == 'HOUR':
                     partition_size = timedelta(hour=1)
                 elif partition_type == 'MONTH':
-                    # TODO: Note this is only a guesstimate, months are not standard size
-                    partition_size = timedelta(weeks=4)
+                    # TODO: Note this is only a guesstimate but is roughly going to query every 6 months
+                    partition_size = timedelta(weeks=(4*6))
                 else:
                     LOGGER.info(f"Skipping table {t.full_table_id}: Unsupported partition type: {partition_type}")
                     continue
