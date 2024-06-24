@@ -255,7 +255,7 @@ def round_to_partition(datetime, step):
         return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     if step == timedelta(hours=1):
         return datetime.replace(minute=0, second=0, microsecond=0)
-    if step == timedelta(weeks=4):
+    if step == timedelta(weeks=(4*6)):
         return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         raise NotImplementedError(f"Unsupported partition type: {step}")
