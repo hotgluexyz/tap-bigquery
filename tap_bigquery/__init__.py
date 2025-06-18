@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import time
-import json
 import singer
 import datetime
 import urllib3
@@ -15,8 +14,12 @@ from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
 
 from google.oauth2 import service_account
-from google.api_core import retry
 from google.cloud import bigquery
+
+import psutil
+import pyarrow.parquet as pq
+import pyarrow as pa
+
 
 REQUIRED_CONFIG_KEYS = ['start_date', 'project', 'credentials_path']
 LOGGER = singer.get_logger()
@@ -155,7 +158,13 @@ def discover(config, client):
     return Catalog(streams)
 
 
-def sync(config, state, catalog, client):
+def log_memory_usage(msg):
+    process = psutil.Process(os.getpid())
+    memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
+    LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg} - Memory usage: {memory_usage:.2f} MB")
+
+
+def sync(config, state, catalog, client, job_id, parquet_file_datetime):
     """ Sync data from tap source """
     # Loop over selected streams in catalog
     for stream in catalog.get_selected_streams(state):
@@ -172,6 +181,11 @@ def sync(config, state, catalog, client):
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata['table-name']
+        
+        # output directory
+        output_dir = "../.secrets"  #f"/home/hotglue/{job_id}/sync-output"
+        file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
+
 
         LOGGER.info(stream.replication_key)
 
@@ -180,6 +194,7 @@ def sync(config, state, catalog, client):
             step = timedelta(seconds=step_sec)
 
             with Transformer() as transformer:
+                writer = None
                 while start_date < datetime.datetime.now(timezone.utc):
                     params = {
                         'table_name': table_name,
@@ -191,15 +206,27 @@ def sync(config, state, catalog, client):
                     attempts = 0
                     while True:
                         try:
-                            LOGGER.info("Running query:\n    %s" % query)
-                            query_job = client.query(query)
+                            LOGGER.info(f"Running query:\n    %s" % query)
+                            log_memory_usage(f"Before querying")
+                            df = client.query(query).result().to_dataframe(bqstorage_client=None)
+                            log_memory_usage(f"After querying")
 
-                            for row in query_job:
-                                record = { k: v for k, v in row.items() }
-                                record = deep_convert_datetimes(record)
-                                record = transformer.transform(record, schema)
-                                singer.write_record(stream_name, record)
-                            break
+                            df = df.applymap(deep_convert_datetimes)
+
+                            if df.empty:
+                                break
+
+                            table = pa.Table.from_pandas(df)
+                                
+                            LOGGER.info(f"Writing to parquet")
+                            if writer is None:
+                                writer = pq.ParquetWriter(file_path, table.schema)
+                            
+                            writer.write_table(table)
+                            log_memory_usage(f"Finished writing batch {batch_num}")
+                            offset += batch_size
+                            batch_num += 1
+
                         except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
                             LOGGER.warn(e)
                             attempts += 1
@@ -211,24 +238,58 @@ def sync(config, state, catalog, client):
                     state[stream.tap_stream_id] = start_date.isoformat()
                     singer.write_state(state)
                     start_date = round_to_partition(start_date + step, step)
+                
+                if writer:
+                    writer.close()
+                    LOGGER.info(f"Finished writing {file_path}")
+                    break
+    
+        
         else:
             with Transformer() as transformer:
-                params = {
-                    'table_name': table_name
-                }
-                query = """SELECT * FROM `{table_name}`""".format(**params)
+                limit = 100_000
+                offset = 0
                 attempts = 0
                 while True:
                     try:
-                        LOGGER.info("Running query:\n    %s" % query)
-                        query_job = client.query(query)
+                        # READ DATAFRAME
+                        writer = None
 
-                        for row in query_job:
-                            record = { k: v for k, v in row.items() }
-                            record = deep_convert_datetimes(record)
-                            record = transformer.transform(record, schema)
-                            singer.write_record(stream_name, record)
-                        break
+                        batch_size = 100_000
+                        offset = 0
+                        batch_num = 0
+
+                        while True:
+                            query = f"SELECT * FROM `{table_name}` LIMIT {limit} OFFSET {offset}"
+
+                            LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Running query:\n    %s" % query)
+                            log_memory_usage(f"Before querying")
+
+                            df = client.query(query).result().to_dataframe(bqstorage_client=None)
+                            log_memory_usage(f"After querying")
+
+                            if df.empty:
+                                break
+
+                            df = df.applymap(deep_convert_datetimes)
+                            table = pa.Table.from_pandas(df)
+                                
+                            LOGGER.info(f" {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Writing to parquet")
+                            if writer is None:
+                                writer = pq.ParquetWriter(file_path, table.schema)
+                            
+                            writer.write_table(table)
+                            del df, table
+                            log_memory_usage(f"Finished writing batch {batch_num}")
+                            offset += batch_size
+                            batch_num += 1
+
+                        if writer:
+                            writer.close()
+                            LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Finished writing {file_path}")
+                            break
+
+
                     except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
                         LOGGER.warn(e)
                         attempts += 1
@@ -269,6 +330,9 @@ def main():
     credentials = service_account.Credentials.from_service_account_file(args.config['credentials_path'])
     client = bigquery.Client(project=args.config['project'], credentials=credentials)
 
+    job_id = os.environ.get("JOB_ID")
+    parquet_file_datetime = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+
     # If discover flag was passed, run discovery mode and dump output to stdout
     if args.discover:
         catalog = discover(args.config, client)
@@ -279,7 +343,7 @@ def main():
             catalog = args.catalog
         else:
             catalog = discover(args.config, client)
-        sync(args.config, args.state, catalog, client)
+        sync(args.config, args.state, catalog, client, job_id, parquet_file_datetime)
 
 
 if __name__ == '__main__':
