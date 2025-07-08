@@ -161,17 +161,13 @@ def discover(config, client):
     return Catalog(streams)
 
 
-def write_job_metrics(destination_path, job_metrics):
-    destination_path = "../.secrets" #f"/home/hotglue/{job_id}"
+def write_job_metrics(destination_path, job_metrics, job_id):
+    destination_path = f"/home/hotglue/{job_id}"
     job_metrics_file_path = os.path.expanduser(os.path.join(destination_path, "job_metrics.json"))
 
-    if not os.path.isfile(job_metrics_file_path):
-        pathlib.Path(job_metrics_file_path).touch()
-
-    with open(job_metrics_file_path, 'r+') as job_metrics_file:
+    with open(job_metrics_file_path, 'w') as job_metrics_file:
         content = dict()
         content['recordCount'] = job_metrics
-        job_metrics_file.seek(0)
         job_metrics_file.write(json.dumps(content))
 
 
@@ -205,7 +201,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         table_name = base_metadata['table-name']
         
         # output directory
-        output_dir = "../.secrets"  #f"/home/hotglue/{job_id}/sync-output"
+        output_dir = f"/home/hotglue/{job_id}/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
 
 
@@ -330,7 +326,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         job_metrics[stream.tap_stream_id] = stream_count
     
     # write job metrics to file
-    write_job_metrics(output_dir, job_metrics)
+    write_job_metrics(output_dir, job_metrics, job_id)
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
