@@ -20,6 +20,9 @@ import psutil
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+import pathlib
+import json
+
 
 REQUIRED_CONFIG_KEYS = ['start_date', 'project', 'credentials_path']
 LOGGER = singer.get_logger()
@@ -158,6 +161,20 @@ def discover(config, client):
     return Catalog(streams)
 
 
+def write_job_metrics(destination_path, job_metrics):
+    destination_path = "../.secrets" #f"/home/hotglue/{job_id}"
+    job_metrics_file_path = os.path.expanduser(os.path.join(destination_path, "job_metrics.json"))
+
+    if not os.path.isfile(job_metrics_file_path):
+        pathlib.Path(job_metrics_file_path).touch()
+
+    with open(job_metrics_file_path, 'r+') as job_metrics_file:
+        content = dict()
+        content['recordCount'] = job_metrics
+        job_metrics_file.seek(0)
+        job_metrics_file.write(json.dumps(content))
+
+
 def log_memory_usage(msg):
     process = psutil.Process(os.getpid())
     memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
@@ -166,9 +183,14 @@ def log_memory_usage(msg):
 
 def sync(config, state, catalog, client, job_id, parquet_file_datetime):
     """ Sync data from tap source """
+
+    job_metrics = dict()
+    
     # Loop over selected streams in catalog
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
+
+        stream_count = 0
 
         schema = stream.schema.to_dict()
         stream_name = stream.table or stream.stream or stream.tap_stream_id
@@ -221,8 +243,10 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                             LOGGER.info(f"Writing to parquet")
                             if writer is None:
                                 writer = pq.ParquetWriter(file_path, table.schema)
-                            
+
                             writer.write_table(table)
+                            stream_count += len(df)
+                            del df, table
                             log_memory_usage(f"Finished writing batch {batch_num}")
                             offset += batch_size
                             batch_num += 1
@@ -279,6 +303,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                                 writer = pq.ParquetWriter(file_path, table.schema)
                             
                             writer.write_table(table)
+                            stream_count += len(df)
                             del df, table
                             log_memory_usage(f"Finished writing batch {batch_num}")
                             offset += batch_size
@@ -301,6 +326,11 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                     state[stream.tap_stream_id] = start_date.isoformat()
                     singer.write_state(state)
 
+        # add stream count to job metrics
+        job_metrics[stream.tap_stream_id] = stream_count
+    
+    # write job metrics to file
+    write_job_metrics(output_dir, job_metrics)
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
