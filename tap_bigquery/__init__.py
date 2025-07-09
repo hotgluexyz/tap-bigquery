@@ -20,9 +20,9 @@ import psutil
 import pyarrow.parquet as pq
 import pyarrow as pa
 
-import pathlib
+import gc
 import json
-
+import pathlib
 
 REQUIRED_CONFIG_KEYS = ['start_date', 'project', 'credentials_path']
 LOGGER = singer.get_logger()
@@ -161,16 +161,6 @@ def discover(config, client):
     return Catalog(streams)
 
 
-def write_job_metrics(destination_path, job_metrics, job_id):
-    destination_path = f"/home/hotglue/{job_id}"
-    job_metrics_file_path = os.path.expanduser(os.path.join(destination_path, "job_metrics.json"))
-
-    with open(job_metrics_file_path, 'w') as job_metrics_file:
-        content = dict()
-        content['recordCount'] = job_metrics
-        job_metrics_file.write(json.dumps(content))
-
-
 def log_memory_usage(msg):
     process = psutil.Process(os.getpid())
     memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
@@ -180,13 +170,13 @@ def log_memory_usage(msg):
 def sync(config, state, catalog, client, job_id, parquet_file_datetime):
     """ Sync data from tap source """
 
-    job_metrics = dict()
+    limit = 1_000
     
     # Loop over selected streams in catalog
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
 
-        stream_count = 0
+        offset = 0
 
         schema = stream.schema.to_dict()
         stream_name = stream.table or stream.stream or stream.tap_stream_id
@@ -196,12 +186,17 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
             key_properties=stream.key_properties,
         )
 
+        # convert json schema to pyarrow schema
+        pyarrow_schema = json_schema_to_pyarrow_schema(schema["properties"])
+
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata['table-name']
+        # get the approximate row size in bytes to calculate the limit dynamically per table
+        limit = estimate_limit(client, table_name)
         
         # output directory
-        output_dir = f"/home/hotglue/{job_id}/sync-output"
+        output_dir = "../.secrets" #f"/home/hotglue/{job_id}/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
 
 
@@ -211,105 +206,37 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
             step_sec = base_metadata['table-partition-size'][0] if type(base_metadata['table-partition-size']) == list else base_metadata['table-partition-size']
             step = timedelta(seconds=step_sec)
 
-            with Transformer() as transformer:
-                writer = None
-                while start_date < datetime.datetime.now(timezone.utc):
-                    params = {
-                        'table_name': table_name,
-                        'replication_key': stream.replication_key,
-                        'start_date': start_date,
-                        'end_date': start_date + step
-                    }
-                    query = """SELECT * FROM `{table_name}` WHERE {replication_key} >= timestamp '{start_date}' AND {replication_key} < timestamp '{end_date}' ORDER BY {replication_key}""".format(**params)
-                    attempts = 0
-                    while True:
-                        try:
-                            LOGGER.info(f"Running query:\n    %s" % query)
-                            log_memory_usage(f"Before querying")
-                            df = client.query(query).result().to_dataframe(bqstorage_client=None)
-                            log_memory_usage(f"After querying")
-
-                            df = df.applymap(deep_convert_datetimes)
-
-                            if df.empty:
-                                break
-
-                            table = pa.Table.from_pandas(df)
-                                
-                            LOGGER.info(f"Writing to parquet")
-                            if writer is None:
-                                writer = pq.ParquetWriter(file_path, table.schema)
-
-                            writer.write_table(table)
-                            stream_count += len(df)
-                            del df, table
-                            log_memory_usage(f"Finished writing batch {batch_num}")
-                            offset += batch_size
-                            batch_num += 1
-
-                        except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
-                            LOGGER.warn(e)
-                            attempts += 1
-                            if attempts > 3:
-                                time.sleep(2**attempts)
-                                pass
-                            raise e
-
-                    state[stream.tap_stream_id] = start_date.isoformat()
-                    singer.write_state(state)
-                    start_date = round_to_partition(start_date + step, step)
-                
-                if writer:
-                    writer.close()
-                    LOGGER.info(f"Finished writing {file_path}")
-                    break
-    
-        
-        else:
-            with Transformer() as transformer:
-                limit = 100_000
-                offset = 0
+            writer = None
+            while start_date < datetime.datetime.now(timezone.utc):
+                end_date = start_date + step
+                query = f"SELECT * FROM `{table_name}` WHERE {stream.replication_key} >= timestamp '{start_date}' AND {stream.replication_key} < timestamp '{end_date}' ORDER BY {stream.replication_key} LIMIT {limit} OFFSET {offset}"
                 attempts = 0
                 while True:
                     try:
-                        # READ DATAFRAME
-                        writer = None
+                        LOGGER.info(f"Running query:\n    %s" % query)
+                        log_memory_usage(f"Before querying")
+                        df = client.query(query).result().to_dataframe(bqstorage_client=None)
+                        log_memory_usage(f"After querying")
 
-                        batch_size = 100_000
-                        offset = 0
-                        batch_num = 0
+                        df_old = df # keep a reference to the original dataframe to explicitly delete it and free memory
+                        df = df.applymap(deep_convert_datetimes) # applymao creates a deep copy of the dataframe, so we can delete the original dataframe
 
-                        while True:
-                            query = f"SELECT * FROM `{table_name}` LIMIT {limit} OFFSET {offset}"
-
-                            LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Running query:\n    %s" % query)
-                            log_memory_usage(f"Before querying")
-
-                            df = client.query(query).result().to_dataframe(bqstorage_client=None)
-                            log_memory_usage(f"After querying")
-
-                            if df.empty:
-                                break
-
-                            df = df.applymap(deep_convert_datetimes)
-                            table = pa.Table.from_pandas(df)
-                                
-                            LOGGER.info(f" {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Writing to parquet")
-                            if writer is None:
-                                writer = pq.ParquetWriter(file_path, table.schema)
-                            
-                            writer.write_table(table)
-                            stream_count += len(df)
-                            del df, table
-                            log_memory_usage(f"Finished writing batch {batch_num}")
-                            offset += batch_size
-                            batch_num += 1
-
-                        if writer:
-                            writer.close()
-                            LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Finished writing {file_path}")
+                        if df.empty:
                             break
 
+                        table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
+                            
+                        LOGGER.info(f"Writing to parquet")
+                        if writer is None:
+                            writer = pq.ParquetWriter(file_path, table.schema)
+
+                        writer.write_table(table)
+                        update_job_metrics(stream.tap_stream_id, len(df), job_id)
+                        del df, table, df_old
+                        gc.collect()
+                        log_memory_usage(f"Finished writing batch {batch_num}")
+                        offset += limit
+                        batch_num += 1
 
                     except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
                         LOGGER.warn(e)
@@ -319,14 +246,68 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                             pass
                         raise e
 
-                    state[stream.tap_stream_id] = start_date.isoformat()
-                    singer.write_state(state)
+                state[stream.tap_stream_id] = start_date.isoformat()
+                singer.write_state(state)
+                start_date = round_to_partition(start_date + step, step)
+            
+            if writer:
+                writer.close()
+                LOGGER.info(f"Finished writing {file_path}")
+                break
+        
+        else:
+            attempts = 0
+            while True:
+                try:
+                    # READ DATAFRAME
+                    writer = None
+                    batch_num = 0
 
-        # add stream count to job metrics
-        job_metrics[stream.tap_stream_id] = stream_count
-    
-    # write job metrics to file
-    write_job_metrics(output_dir, job_metrics, job_id)
+                    while True:
+                        query = f"SELECT * FROM `{table_name}` LIMIT {limit} OFFSET {offset}"
+
+                        LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Running query:\n    %s" % query)
+                        log_memory_usage(f"Before querying")
+
+                        df = client.query(query).result().to_dataframe(bqstorage_client=None)
+                        log_memory_usage(f"After querying")
+
+                        if df.empty:
+                            break
+                        
+                        df_old = df # keep a reference to the original dataframe to explicitly delete it and free memory
+                        df = df.applymap(deep_convert_datetimes) # applymao creates a deep copy of the dataframe, so we can delete the original dataframe
+                        table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
+                            
+                        LOGGER.info(f" {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Writing to parquet")
+                        if writer is None:
+                            writer = pq.ParquetWriter(file_path, table.schema)
+                        
+                        writer.write_table(table)
+                        update_job_metrics(stream.tap_stream_id, len(df), job_id)
+                        del df, table
+                        gc.collect()
+                        log_memory_usage(f"Finished writing batch {batch_num}")
+                        offset += limit
+                        batch_num += 1
+
+                    if writer:
+                        writer.close()
+                        LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Finished writing {file_path}")
+                        break
+
+                except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
+                    LOGGER.warn(e)
+                    attempts += 1
+                    if attempts > 3:
+                        time.sleep(2**attempts)
+                        pass
+                    raise e
+
+                state[stream.tap_stream_id] = start_date.isoformat()
+                singer.write_state(state)
+
+
 
 def deep_convert_datetimes(value):
     if isinstance(value, list):
@@ -346,6 +327,161 @@ def round_to_partition(datetime, step):
         return datetime.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         raise NotImplementedError(f"Unsupported partition type: {step}")
+    
+def to_arrow_type(schema):
+    """
+    Convert a JSON schema type to a PyArrow data type.
+    
+    Args:
+        schema (dict): A JSON schema dictionary containing type information
+        
+    Returns:
+        pyarrow.DataType: The corresponding PyArrow data type
+        
+    Examples:
+        >>> to_arrow_type({"type": "string"})
+        StringType
+        >>> to_arrow_type({"type": "integer"})
+        Int64Type
+        >>> to_arrow_type({"type": ["string", "null"]})
+        StringType
+    """
+    json_type = schema.get("type")
+    fmt = schema.get("format")
+
+    # Handle unions
+    if isinstance(json_type, list):
+        non_null_types = [t for t in json_type if t != "null"]
+        json_type = non_null_types[0] if non_null_types else "string"
+
+    # Handle formats
+    if fmt == "float":
+        return pa.float64()
+
+    if json_type == "string":
+        return pa.string()
+    elif json_type == "boolean":
+        return pa.bool_()
+    elif json_type == "integer":
+        return pa.int64()
+    elif json_type == "number":
+        return pa.float64()
+    elif json_type == "array":
+        item_type = to_arrow_type(schema.get("items", {}))
+        return pa.list_(item_type)
+    elif json_type == "object":
+        props = schema.get("properties", {})
+        fields = [
+            pa.field(name, to_arrow_type(subschema))
+            for name, subschema in props.items()
+        ]
+        return pa.struct(fields)
+    else:
+        return pa.string()  # fallback
+
+def json_schema_to_pyarrow_schema(properties: dict) -> pa.Schema:
+    """
+    Convert a JSON schema properties dictionary to a PyArrow schema.
+    
+    Args:
+        properties (dict): A dictionary mapping field names to their JSON schemas
+        
+    Returns:
+        pyarrow.Schema: A PyArrow schema object containing all the fields
+        
+    Examples:
+        >>> properties = {
+        ...     "name": {"type": "string"},
+        ...     "age": {"type": "integer"},
+        ...     "active": {"type": "boolean"}
+        ... }
+        >>> schema = json_schema_to_pyarrow_schema(properties)
+        >>> print(schema)
+        name: string
+        age: int64
+        active: bool
+    """
+    fields = []
+    for name, schema in properties.items():
+        arrow_type = to_arrow_type(schema)
+        fields.append(pa.field(name, arrow_type))
+    return pa.schema(fields)
+
+
+def estimate_limit(client, table_id, target_batch_size_mb=1):
+    """
+    Estimate the number of rows to fetch to achieve a target batch size in megabytes.
+    
+    This function calculates the optimal row limit for BigQuery table queries based on
+    the table's metadata (number of rows and total bytes) to achieve the desired batch size.
+    
+    Args:
+        client: BigQuery client instance
+        table_id (str): The ID of the BigQuery table
+        target_batch_size_mb (int, optional): Target batch size in megabytes. Defaults to 1, the vytes size calculated by bigquery is compressed
+        
+    Returns:
+        int: The estimated number of rows to fetch, with a minimum of 100 rows
+        
+    Examples:
+        >>> limit = estimate_limit(client, "project.dataset.table", target_batch_size_mb=5)
+        >>> print(f"Fetch {limit} rows for ~5MB batch")
+    """
+    table = client.get_table(table_id)
+    if table.num_rows == 0 or table.num_bytes == 0:
+        return 1_000  # Fallback if empty
+    row_size_bytes = table.num_bytes / table.num_rows
+    target_batch_bytes = target_batch_size_mb * 1024 * 1024
+    limit =  max(int(target_batch_bytes / row_size_bytes), 100) 
+    return limit
+
+
+def update_job_metrics(stream_name: str, record_count: int, job_id: str):
+    """
+    Update metrics for a running job by tracking record counts per stream.
+
+    This function maintains a JSON file that keeps track of the number of records
+    processed for each stream during a job execution. The metrics are stored in
+    a 'job_metrics.json' file in the specified folder path.
+
+    Args:
+        stream_name (str): The name of the stream being processed
+        record_count (int): Number of records processed in the current batch
+        job_id (str): Unique identifier for the current job
+
+    Examples:
+        >>> update_job_metrics("customers", 1000, "job_123")
+        # Updates job_metrics.json with:
+        # {
+        #   "recordCount": {
+        #     "customers": 1000
+        #   }
+        # }
+    """
+    folder_path = "../.secrets" #f"/home/hotglue/{job_id}"
+    job_metrics_path = os.path.expanduser(os.path.join(folder_path, "job_metrics.json"))
+
+    if not os.path.isfile(job_metrics_path):
+        pathlib.Path(job_metrics_path).touch()
+
+    with open(job_metrics_path, "r+") as f:
+        content = dict()
+
+        try:
+            content = json.loads(f.read())
+        except:
+            pass
+
+        if not content.get("recordCount"):
+            content["recordCount"] = dict()
+
+        content["recordCount"][stream_name] = (
+            content["recordCount"].get(stream_name, 0) + record_count
+        )
+
+        f.seek(0)
+        f.write(json.dumps(content))
+
 
 
 @utils.handle_top_exception(LOGGER)
