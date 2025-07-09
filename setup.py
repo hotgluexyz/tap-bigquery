@@ -13,6 +13,7 @@ setup(
         "singer-python==5.12.1",
         "requests==2.25.1",
         "google-cloud-bigquery==2.34.4",
+        "numpy==1.23.5",
         "pandas==1.3.5",
         "psutil==7.0.0",
         "pyarrow==17.0.0"
