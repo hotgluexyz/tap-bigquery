@@ -196,7 +196,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         limit = estimate_limit(client, table_name)
         
         # output directory
-        output_dir = "../.secrets" #f"/home/hotglue/{job_id}/sync-output"
+        output_dir = f"/home/hotglue/{job_id}/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
 
 
@@ -458,7 +458,7 @@ def update_job_metrics(stream_name: str, record_count: int, job_id: str):
         #   }
         # }
     """
-    folder_path = "../.secrets" #f"/home/hotglue/{job_id}"
+    folder_path = f"/home/hotglue/{job_id}"
     job_metrics_path = os.path.expanduser(os.path.join(folder_path, "job_metrics.json"))
 
     if not os.path.isfile(job_metrics_path):
