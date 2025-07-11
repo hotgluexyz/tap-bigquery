@@ -480,6 +480,7 @@ def update_job_metrics(stream_name: str, record_count: int, job_id: str):
         )
 
         f.seek(0)
+        LOGGER.info(f"Updating job metrics for {stream_name} with {record_count} records")
         f.write(json.dumps(content))
 
 
