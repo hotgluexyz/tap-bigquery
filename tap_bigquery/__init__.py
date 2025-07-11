@@ -458,7 +458,7 @@ def update_job_metrics(stream_name: str, record_count: int, job_id: str):
         #   }
         # }
     """
-    folder_path = f"/home/hotglue/{job_id}"
+    folder_path = f"/home/hotglue/{job_id}/sync-output"
     job_metrics_path = os.path.expanduser(os.path.join(folder_path, "job_metrics.json"))
 
     if not os.path.isfile(job_metrics_path):
