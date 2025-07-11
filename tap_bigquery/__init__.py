@@ -231,7 +231,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                             writer = pq.ParquetWriter(file_path, table.schema)
 
                         writer.write_table(table)
-                        update_job_metrics(stream.tap_stream_id, len(df), job_id)
+                        update_job_metrics(stream.tap_stream_id, len(df), output_dir)
                         del df, table, df_old
                         gc.collect()
                         log_memory_usage(f"Finished writing batch {batch_num}")
@@ -257,15 +257,25 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         
         else:
             attempts = 0
+
+            # create a temp table to generate uuid and paginate over it
+            query = f"CREATE OR REPLACE TABLE {table_name}_temp AS SELECT GENERATE_UUID() AS row_id, * FROM `{table_name}`"
+            client.query(query).result()
+
             while True:
                 try:
                     # READ DATAFRAME
                     writer = None
                     batch_num = 0
 
+                    last_seen_uuid = None
                     while True:
-                        query = f"SELECT * FROM `{table_name}` LIMIT {limit} OFFSET {offset}"
-
+                        where_clause = ""
+                        if last_seen_uuid:
+                            where_clause = f" WHERE row_id > '{last_seen_uuid}'"
+                        
+                        query = f"SELECT * FROM {table_name}_temp {where_clause} ORDER BY row_id ASC LIMIT {limit}"
+                        
                         LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Running query:\n    %s" % query)
                         log_memory_usage(f"Before querying")
 
@@ -273,18 +283,20 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                         log_memory_usage(f"After querying")
 
                         if df.empty:
+                            client.query(f"DROP TABLE `{table_name}_temp`").result()
                             break
                         
                         df_old = df # keep a reference to the original dataframe to explicitly delete it and free memory
                         df = df.applymap(deep_convert_datetimes) # applymao creates a deep copy of the dataframe, so we can delete the original dataframe
                         table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
+                        last_seen_uuid = df['row_id'].iloc[-1]
                             
                         LOGGER.info(f" {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Writing to parquet")
                         if writer is None:
                             writer = pq.ParquetWriter(file_path, table.schema)
                         
                         writer.write_table(table)
-                        update_job_metrics(stream.tap_stream_id, len(df), job_id)
+                        update_job_metrics(stream.tap_stream_id, len(df), output_dir)
                         del df, table
                         gc.collect()
                         log_memory_usage(f"Finished writing batch {batch_num}")
@@ -436,7 +448,7 @@ def estimate_limit(client, table_id, target_batch_size_mb=1):
     return limit
 
 
-def update_job_metrics(stream_name: str, record_count: int, job_id: str):
+def update_job_metrics(stream_name: str, record_count: int, output_dir: str):
     """
     Update metrics for a running job by tracking record counts per stream.
 
@@ -447,7 +459,7 @@ def update_job_metrics(stream_name: str, record_count: int, job_id: str):
     Args:
         stream_name (str): The name of the stream being processed
         record_count (int): Number of records processed in the current batch
-        job_id (str): Unique identifier for the current job
+        output_dir (str): Folder path to store the job metrics
 
     Examples:
         >>> update_job_metrics("customers", 1000, "job_123")
@@ -458,8 +470,7 @@ def update_job_metrics(stream_name: str, record_count: int, job_id: str):
         #   }
         # }
     """
-    folder_path = f"/home/hotglue/{job_id}/sync-output"
-    job_metrics_path = os.path.expanduser(os.path.join(folder_path, "job_metrics.json"))
+    job_metrics_path = os.path.expanduser(os.path.join(output_dir, "job_metrics.json"))
 
     if not os.path.isfile(job_metrics_path):
         pathlib.Path(job_metrics_path).touch()
