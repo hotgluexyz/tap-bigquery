@@ -212,7 +212,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         limit = estimate_limit(client, table_name)
         
         # Set up output directory and file path for Parquet files
-        output_dir = "../.secrets" #f"/home/hotglue/{job_id}/sync-output"
+        output_dir = f"/home/hotglue/{job_id}/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
 
         LOGGER.info(stream.replication_key)
