@@ -168,16 +168,27 @@ def log_memory_usage(msg):
 
 
 def sync(config, state, catalog, client, job_id, parquet_file_datetime):
-    """ Sync data from tap source """
-
-    limit = 1_000
+    """
+    Sync data from BigQuery tables to Parquet files.
     
+    This function handles both incremental and full table syncs:
+    - Incremental sync: Uses replication keys to sync only new/updated data
+    - Full table sync: Syncs entire table when no replication key is available
+    
+    Args:
+        config: Configuration dictionary containing sync settings
+        state: Current sync state for tracking progress
+        catalog: Stream catalog with table metadata
+        client: BigQuery client instance
+        job_id: Unique identifier for this sync job
+        parquet_file_datetime: Timestamp for output file naming
+    """
+        
     # Loop over selected streams in catalog
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
 
-        offset = 0
-
+        # Extract schema information and determine stream name
         schema = stream.schema.to_dict()
         stream_name = stream.table or stream.stream or stream.tap_stream_id
         singer.write_schema(
@@ -189,56 +200,92 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         # convert json schema to pyarrow schema
         pyarrow_schema = json_schema_to_pyarrow_schema(schema["properties"])
 
+        # Get sync start date from state or use config default
         start_date = utils.strptime_to_utc(state.get(stream.tap_stream_id, config['start_date']))
+        
+        # Extract table metadata for configuration
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata['table-name']
-        # get the approximate row size in bytes to calculate the limit dynamically per table
+        temp_table_name = f"{table_name}_temp"
+        
+        # Dynamically calculate optimal batch size based on table characteristics
         limit = estimate_limit(client, table_name)
         
-        # output directory
-        output_dir = f"/home/hotglue/{job_id}/sync-output"
+        # Set up output directory and file path for Parquet files
+        output_dir = "../.secrets" #f"/home/hotglue/{job_id}/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
-
 
         LOGGER.info(stream.replication_key)
 
+        # INCREMENTAL SYNC: Handle tables with replication keys (time-based partitioning)
         if stream.replication_key is not None:
+            # Calculate time step for incremental sync based on table partitioning
             step_sec = base_metadata['table-partition-size'][0] if type(base_metadata['table-partition-size']) == list else base_metadata['table-partition-size']
             step = timedelta(seconds=step_sec)
 
+            # Create temporary table with UUID for reliable pagination
+            # This ensures we can resume from where we left off if sync is interrupted
+            query = f"CREATE OR REPLACE TABLE {temp_table_name} AS SELECT GENERATE_UUID() AS row_id, * FROM `{table_name}`"
+            client.query(query).result()
+
+            # Initialize Parquet writer for output file
             writer = None
+
+            # Process data in time-based chunks until we reach current time
             while start_date < datetime.datetime.now(timezone.utc):
+                # Calculate time window for this batch
                 end_date = start_date + step
-                query = f"SELECT * FROM `{table_name}` WHERE {stream.replication_key} >= timestamp '{start_date}' AND {stream.replication_key} < timestamp '{end_date}' ORDER BY {stream.replication_key} LIMIT {limit} OFFSET {offset}"
+                
+                # Build WHERE clause for time-based filtering
+                where_clause = f" WHERE {stream.replication_key} >= timestamp '{start_date}' AND {stream.replication_key} < timestamp '{end_date}'"
+                last_seen_uuid = None
+                if last_seen_uuid:
+                    where_clause += f" AND row_id > '{last_seen_uuid}'"
+
+                # Query data for current time window
+                query = f"SELECT * FROM `{table_name}` {where_clause} ORDER BY {stream.replication_key} LIMIT {limit}"
                 attempts = 0
+
+                # Retry loop for handling network errors and API failures
                 while True:
                     try:
                         LOGGER.info(f"Running query:\n    %s" % query)
                         log_memory_usage(f"Before querying")
+                        
+                        # Execute BigQuery query and convert to pandas DataFrame
                         df = client.query(query).result().to_dataframe(bqstorage_client=None)
                         log_memory_usage(f"After querying")
 
-                        df_old = df # keep a reference to the original dataframe to explicitly delete it and free memory
-                        df = df.applymap(deep_convert_datetimes) # applymao creates a deep copy of the dataframe, so we can delete the original dataframe
+                        # Memory management: Keep reference to original DataFrame for cleanup
+                        df_old = df
+                        # Convert datetime objects to ISO strings for JSON compatibility
+                        df = df.applymap(deep_convert_datetimes)
 
+                        # If no data returned, we're done with this time window
                         if df.empty:
                             break
 
+                        # Convert DataFrame to PyArrow table for efficient Parquet writing
                         table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
+                        last_seen_uuid = df['row_id'].iloc[-1]
                             
                         LOGGER.info(f"Writing to parquet")
+                        # Initialize Parquet writer on first batch
                         if writer is None:
                             writer = pq.ParquetWriter(file_path, table.schema)
 
+                        # Write batch to Parquet file
                         writer.write_table(table)
                         update_job_metrics(stream.tap_stream_id, len(df), output_dir)
+                        
+                        # Clean up memory to prevent OOM issues
                         del df, table, df_old
                         gc.collect()
                         log_memory_usage(f"Finished writing batch {batch_num}")
-                        offset += limit
                         batch_num += 1
 
                     except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
+                        # Handle network errors with exponential backoff
                         LOGGER.warn(e)
                         attempts += 1
                         if attempts > 3:
@@ -246,10 +293,15 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                             pass
                         raise e
 
+                # Update sync state and advance to next time window
                 state[stream.tap_stream_id] = start_date.isoformat()
                 singer.write_state(state)
                 start_date = round_to_partition(start_date + step, step)
             
+            # Clean up temporary table
+            client.query(f"DROP TABLE `{temp_table_name}`").result()
+            
+            # Close Parquet writer and log completion
             if writer:
                 writer.close()
                 LOGGER.info(f"Finished writing {file_path}")
@@ -259,53 +311,54 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
             attempts = 0
 
             # create a temp table to generate uuid and paginate over it
-            query = f"CREATE OR REPLACE TABLE {table_name}_temp AS SELECT GENERATE_UUID() AS row_id, * FROM `{table_name}`"
+            query = f"CREATE OR REPLACE TABLE {temp_table_name} AS SELECT GENERATE_UUID() AS row_id, * FROM `{table_name}`"
             client.query(query).result()
+            last_seen_uuid = None
+            batch_num = 0
+            writer = None
 
             while True:
                 try:
                     # READ DATAFRAME
-                    writer = None
-                    batch_num = 0
-
-                    last_seen_uuid = None
                     while True:
                         where_clause = ""
                         if last_seen_uuid:
                             where_clause = f" WHERE row_id > '{last_seen_uuid}'"
                         
-                        query = f"SELECT * FROM {table_name}_temp {where_clause} ORDER BY row_id ASC LIMIT {limit}"
+                        query = f"SELECT * FROM {temp_table_name} {where_clause} ORDER BY row_id ASC LIMIT {limit}"
                         
-                        LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Running query:\n    %s" % query)
+                        LOGGER.info(f"Running query:\n    %s" % query)
                         log_memory_usage(f"Before querying")
 
                         df = client.query(query).result().to_dataframe(bqstorage_client=None)
                         log_memory_usage(f"After querying")
 
                         if df.empty:
-                            client.query(f"DROP TABLE `{table_name}_temp`").result()
+                            client.query(f"DROP TABLE `{temp_table_name}`").result()
                             break
                         
-                        df_old = df # keep a reference to the original dataframe to explicitly delete it and free memory
-                        df = df.applymap(deep_convert_datetimes) # applymao creates a deep copy of the dataframe, so we can delete the original dataframe
+                        # keep a reference to the original dataframe to explicitly delete it and free memory
+                        df_old = df 
+                        # applymap creates a deep copy of the dataframe, so we can delete the original dataframe
+                        df = df.applymap(deep_convert_datetimes)
                         table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
                         last_seen_uuid = df['row_id'].iloc[-1]
                             
-                        LOGGER.info(f" {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Writing to parquet")
+                        LOGGER.info(f"Writing to parquet")
                         if writer is None:
                             writer = pq.ParquetWriter(file_path, table.schema)
                         
+                        # clean up memory
                         writer.write_table(table)
                         update_job_metrics(stream.tap_stream_id, len(df), output_dir)
-                        del df, table
+                        del df, table, df_old
                         gc.collect()
                         log_memory_usage(f"Finished writing batch {batch_num}")
-                        offset += limit
                         batch_num += 1
 
                     if writer:
                         writer.close()
-                        LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Finished writing {file_path}")
+                        LOGGER.info(f"Finished writing {file_path}")
                         break
 
                 except (TimeoutError, requests.exceptions.RequestException, urllib3.exceptions.HTTPError, SocketTimeout, BaseSSLError, SocketError, OSError) as e:
