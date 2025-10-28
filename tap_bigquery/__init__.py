@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import secrets
+import string
 import time
 import singer
 import datetime
@@ -166,6 +168,9 @@ def log_memory_usage(msg):
     memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
     LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg} - Memory usage: {memory_usage:.2f} MB")
 
+def random_hash(length=6):
+    ALPHANUM = string.ascii_letters + string.digits  # a-zA-Z0-9
+    return ''.join(secrets.choice(ALPHANUM) for _ in range(length))
 
 def sync(config, state, catalog, client, job_id, parquet_file_datetime):
     """
@@ -206,13 +211,17 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         # Extract table metadata for configuration
         base_metadata = metadata.to_map(stream.metadata)[()]
         table_name = base_metadata['table-name']
-        temp_table_name = f"{table_name}_temp"
+        temp_table_name = f"{table_name}_temp_{random_hash()}"
         
         # Dynamically calculate optimal batch size based on table characteristics
         limit = estimate_limit(client, table_name)
         
         # Set up output directory and file path for Parquet files
-        output_dir = f"/home/hotglue/{job_id}/sync-output"
+        if job_id:
+            output_dir = f"/home/hotglue/{job_id}/sync-output"
+        else:
+            # for local testing
+            output_dir = "../.secrets/sync-output"
         file_path = os.path.join(output_dir, f"{stream_name}-{parquet_file_datetime}.parquet")
 
         LOGGER.info(stream.replication_key)
