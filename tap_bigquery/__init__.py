@@ -11,7 +11,7 @@ from socket import error as SocketError
 from socket import timeout as SocketTimeout
 from ssl import SSLError as BaseSSLError
 from datetime import timedelta, timezone
-from singer import Transformer, utils, metadata
+from singer import utils, metadata
 from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
 
@@ -99,7 +99,7 @@ def discover(config, client):
 
             try:
                 schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
-            except:
+            except Exception:
                 LOGGER.exception(f"Skipping table {t.full_table_id}: Error:")
                 continue
 
@@ -229,7 +229,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
         # INCREMENTAL SYNC: Handle tables with replication keys (time-based partitioning)
         if stream.replication_key is not None:
             # Calculate time step for incremental sync based on table partitioning
-            step_sec = base_metadata['table-partition-size'][0] if type(base_metadata['table-partition-size']) == list else base_metadata['table-partition-size']
+            step_sec = base_metadata['table-partition-size'][0] if isinstance(base_metadata['table-partition-size'], list) else base_metadata['table-partition-size']
             step = timedelta(seconds=step_sec)
 
             # Create temporary table with UUID for reliable pagination
@@ -254,16 +254,17 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                 # Query data for current time window
                 query = f"SELECT * FROM `{table_name}` {where_clause} ORDER BY {stream.replication_key} LIMIT {limit}"
                 attempts = 0
+                batch_num = 0
 
                 # Retry loop for handling network errors and API failures
                 while True:
                     try:
-                        LOGGER.info(f"Running query:\n    %s" % query)
-                        log_memory_usage(f"Before querying")
+                        LOGGER.info("Running query:\n    %s" % query)
+                        log_memory_usage("Before querying")
                         
                         # Execute BigQuery query and convert to pandas DataFrame
                         df = client.query(query).result().to_dataframe(bqstorage_client=None)
-                        log_memory_usage(f"After querying")
+                        log_memory_usage("After querying")
 
                         # Memory management: Keep reference to original DataFrame for cleanup
                         df_old = df
@@ -278,7 +279,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                         table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
                         last_seen_uuid = df['row_id'].iloc[-1]
                             
-                        LOGGER.info(f"Writing to parquet")
+                        LOGGER.info("Writing to parquet")
                         # Initialize Parquet writer on first batch
                         if writer is None:
                             writer = pq.ParquetWriter(file_path, table.schema)
@@ -336,11 +337,11 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                         
                         query = f"SELECT * FROM {temp_table_name} {where_clause} ORDER BY row_id ASC LIMIT {limit}"
                         
-                        LOGGER.info(f"Running query:\n    %s" % query)
-                        log_memory_usage(f"Before querying")
+                        LOGGER.info("Running query:\n    %s" % query)
+                        log_memory_usage("Before querying")
 
                         df = client.query(query).result().to_dataframe(bqstorage_client=None)
-                        log_memory_usage(f"After querying")
+                        log_memory_usage("After querying")
 
                         if df.empty:
                             client.query(f"DROP TABLE `{temp_table_name}`").result()
@@ -353,7 +354,7 @@ def sync(config, state, catalog, client, job_id, parquet_file_datetime):
                         table = pa.Table.from_pandas(df, schema=pyarrow_schema, preserve_index=False)
                         last_seen_uuid = df['row_id'].iloc[-1]
                             
-                        LOGGER.info(f"Writing to parquet")
+                        LOGGER.info("Writing to parquet")
                         if writer is None:
                             writer = pq.ParquetWriter(file_path, table.schema)
                         
@@ -542,7 +543,7 @@ def update_job_metrics(stream_name: str, record_count: int, output_dir: str):
 
         try:
             content = json.loads(f.read())
-        except:
+        except Exception:
             pass
 
         if not content.get("recordCount"):
